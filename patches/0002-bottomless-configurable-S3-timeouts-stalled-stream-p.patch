@@ -1,0 +1,384 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Kuznetsov <igk@igk.one>
+Date: Fri, 2 Oct 2026 17:27:40 +0500
+Subject: [PATCH] bottomless: configurable S3 timeouts, stalled-stream
+ protection and snapshot upload attempts
+
+---
+ .gitignore                                |   1 +
+ bottomless/src/replicator.rs              | 103 +++++++++++++++++++---
+ libsql-server/src/namespace/meta_store.rs |   4 +
+ libsql-server/src/test/bottomless.rs      |  87 ++++++++++++++++++
+ 4 files changed, 182 insertions(+), 13 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 2af81b93bc79841287991e700bd233293cd615c9..ac61c4d2e0801715047860812cee08e5e133ec0d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,6 +9,7 @@ libsql-server/testsnapshotretry/**
+ libsql-server/testsnapshotwedge/**
+ libsql-server/testsnapshotoverlap/**
+ libsql-server/testsnapshotdep/**
++libsql-server/testsnapshothang/**
+ libsql-sqlite3/**.o.tmp
+ /libsql-ffi/bundled/SQLite3MultipleCiphers/build/**
+ # will be copied from bundled/src
+diff --git a/bottomless/src/replicator.rs b/bottomless/src/replicator.rs
+index b6f7fd760c482563ecedbcf306b8a4987faf387d..9d249b340291dc040d74bd0f2438343a8b0eb9f1 100644
+--- a/bottomless/src/replicator.rs
++++ b/bottomless/src/replicator.rs
+@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Context as _};
+ use arc_swap::ArcSwapOption;
+ use async_compression::tokio::write::{GzipEncoder, ZstdEncoder};
+ use aws_config::BehaviorVersion;
++use aws_sdk_s3::config::timeout::TimeoutConfig;
+ use aws_sdk_s3::config::{
+     Credentials, Region, SharedCredentialsProvider, StalledStreamProtectionConfig,
+ };
+@@ -43,14 +44,17 @@ use uuid::{NoContext, Uuid};
+ /// consecutive generations has to have a snapshot included.
+ const MAX_RESTORE_STACK_DEPTH: usize = 100;
+ 
+-/// Maximum number of attempts for the snapshot upload of a single generation.
++/// Default maximum number of attempts for the snapshot upload of a single
++/// generation ([Options::snapshot_upload_attempts]).
+ /// A snapshot upload streams the whole (compressed) database file in a single
+ /// request that may run for minutes; if its body stream is aborted mid-flight
+ /// the SDK cannot retry the request on its own, so the snapshot task rebuilds
+ /// the request from scratch and tries again.
+-const SNAPSHOT_UPLOAD_ATTEMPTS: u32 = 3;
++pub const SNAPSHOT_UPLOAD_ATTEMPTS: u32 = 3;
+ /// Base delay between snapshot upload attempts, doubled on every retry.
+ const SNAPSHOT_UPLOAD_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
++/// Upper bound for the delay between snapshot upload attempts.
++const SNAPSHOT_UPLOAD_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+ 
+ pub type Result<T> = anyhow::Result<T>;
+ 
+@@ -76,6 +80,7 @@ pub struct Replicator {
+     /// snapshot is still uploading" from "the snapshot failed and has to be
+     /// re-triggered".
+     snapshot_in_flight: Arc<AtomicBool>,
++    snapshot_upload_attempts: u32,
+ 
+     pub page_size: usize,
+     generation: Arc<ArcSwapOption<Uuid>>,
+@@ -150,6 +155,16 @@ pub struct Options {
+     pub s3_max_parallelism: usize,
+     /// Max number of retries for S3 operations
+     pub s3_max_retries: u32,
++    /// Timeout for establishing a connection to S3; `None` means no timeout.
++    pub s3_connect_timeout: Option<Duration>,
++    /// Timeout for a single attempt of an S3 request: sending the request with
++    /// its body and reading the response, except for a streamed response body
++    /// (e.g. a snapshot download during restore). `None` means no timeout.
++    pub s3_attempt_timeout: Option<Duration>,
++    /// Grace period of the SDK's stalled-stream protection; `None` disables it.
++    pub s3_stalled_stream_grace_period: Option<Duration>,
++    /// Max number of attempts for the snapshot upload of a single generation.
++    pub snapshot_upload_attempts: u32,
+     /// Skip snapshot upload per checkpoint.
+     pub skip_snapshot: bool,
+     /// Skip uploading snapshots on shutdown
+@@ -190,16 +205,39 @@ impl Options {
+             )
+             .build();
+ 
++        let mut timeouts = TimeoutConfig::builder();
++        timeouts.set_connect_timeout(self.s3_connect_timeout);
++        timeouts.set_operation_attempt_timeout(self.s3_attempt_timeout);
++
++        // The SDK's stalled-stream protection aborts uploads whose body
++        // stream stays below a minimum throughput for a ~5s grace period.
++        // A snapshot upload streams the whole database file in a single
++        // request that can run for many minutes and legitimately stalls
++        // when the process is busy (e.g. while compressing another
++        // database's snapshot), which would get it killed mid-flight.
++        // Bottomless owns its retry policy, so the watchdog is disabled
++        // unless a grace period long enough for such stalls is configured.
++        // Once the body has been sent in full the watchdog stops, so a request
++        // stuck waiting for its response is bounded only by the attempt timeout.
++        let stalled_stream_protection = match self.s3_stalled_stream_grace_period {
++            Some(grace_period) => StalledStreamProtectionConfig::enabled()
++                .grace_period(grace_period)
++                .build(),
++            None => StalledStreamProtectionConfig::disabled(),
++        };
++
++        tracing::info!(
++            "bottomless S3 client: connect timeout {:?}, attempt timeout {:?}, max attempts {}, stalled-stream protection grace period {:?}",
++            self.s3_connect_timeout,
++            self.s3_attempt_timeout,
++            self.s3_max_retries,
++            self.s3_stalled_stream_grace_period
++        );
++
+         let s3_config = aws_sdk_s3::config::Builder::from(&conf)
+             .force_path_style(true)
+-            // The SDK's stalled-stream protection aborts uploads whose body
+-            // stream stays below a minimum throughput for a ~5s grace period.
+-            // A snapshot upload streams the whole database file in a single
+-            // request that can run for many minutes and legitimately stalls
+-            // when the process is busy (e.g. while compressing another
+-            // database's snapshot), which would get it killed mid-flight.
+-            // Bottomless owns its retry policy, so the watchdog is disabled.
+-            .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
++            .timeout_config(timeouts.build())
++            .stalled_stream_protection(stalled_stream_protection)
+             .build();
+ 
+         Ok(s3_config)
+@@ -225,6 +263,19 @@ impl Options {
+                 Err(_) => default_value.to_string(),
+             }
+         }
++        fn env_secs(key: &str) -> Result<Option<Duration>> {
++            let Ok(value) = env_var(key) else {
++                return Ok(None);
++            };
++            match value.parse::<u64>() {
++                Ok(secs) if secs > 0 => Ok(Some(Duration::from_secs(secs))),
++                _ => bail!(
++                    "Invalid {} environment variable: {} (expected a positive number of seconds)",
++                    key,
++                    value
++                ),
++            }
++        }
+ 
+         let db_id = env_var("LIBSQL_BOTTOMLESS_DATABASE_ID").ok();
+         let aws_endpoint = env_var("LIBSQL_BOTTOMLESS_ENDPOINT").ok();
+@@ -270,6 +321,21 @@ impl Options {
+             ),
+         };
+         let s3_max_retries = env_var_or("LIBSQL_BOTTOMLESS_S3_MAX_RETRIES", 10).parse::<u32>()?;
++        let s3_connect_timeout = env_secs("LIBSQL_BOTTOMLESS_S3_CONNECT_TIMEOUT_SECS")?;
++        let s3_attempt_timeout = env_secs("LIBSQL_BOTTOMLESS_S3_ATTEMPT_TIMEOUT_SECS")?;
++        let s3_stalled_stream_grace_period =
++            env_secs("LIBSQL_BOTTOMLESS_S3_STALLED_STREAM_GRACE_SECS")?;
++        let snapshot_upload_attempts = env_var_or(
++            "LIBSQL_BOTTOMLESS_SNAPSHOT_UPLOAD_ATTEMPTS",
++            SNAPSHOT_UPLOAD_ATTEMPTS,
++        );
++        let snapshot_upload_attempts = match snapshot_upload_attempts.parse::<u32>() {
++            Ok(attempts) if attempts > 0 => attempts,
++            _ => bail!(
++                "Invalid LIBSQL_BOTTOMLESS_SNAPSHOT_UPLOAD_ATTEMPTS environment variable: {} (expected a positive number)",
++                snapshot_upload_attempts
++            ),
++        };
+         let cipher = match encryption_cipher {
+             Some(cipher) => Cipher::from_str(&cipher)?,
+             None => Cipher::default(),
+@@ -298,6 +364,10 @@ impl Options {
+             region,
+             bucket_name,
+             s3_max_retries,
++            s3_connect_timeout,
++            s3_attempt_timeout,
++            s3_stalled_stream_grace_period,
++            snapshot_upload_attempts,
+             skip_snapshot,
+             skip_shutdown_upload,
+         })
+@@ -542,6 +612,7 @@ impl Replicator {
+             snapshot_waiter,
+             snapshot_notifier: Arc::new(snapshot_notifier),
+             snapshot_in_flight: Arc::new(AtomicBool::new(false)),
++            snapshot_upload_attempts: options.snapshot_upload_attempts,
+             use_compression: options.use_compression,
+             encryption_config: options.encryption_config,
+             max_frames_per_batch: options.max_frames_per_batch,
+@@ -1191,6 +1262,7 @@ impl Replicator {
+         let db_path = PathBuf::from(self.db_path.clone());
+         let db_name = self.db_name.clone();
+         let bucket = self.bucket.clone();
++        let upload_attempts = self.snapshot_upload_attempts;
+         let handle = tokio::spawn(async move {
+             tracing::trace!("Start snapshotting generation {}", generation);
+             let start = Instant::now();
+@@ -1207,6 +1279,7 @@ impl Replicator {
+                     generation,
+                     compression,
+                     change_counter,
++                    upload_attempts,
+                 )
+                 .await
+             };
+@@ -1249,6 +1322,7 @@ impl Replicator {
+         generation: Uuid,
+         compression: CompressionKind,
+         change_counter: [u8; 4],
++        upload_attempts: u32,
+     ) -> Result<()> {
+         // no other snapshot task is in flight, so any artifact still on disk is
+         // a leftover of a previous (interrupted) run
+@@ -1266,6 +1340,7 @@ impl Replicator {
+             &body_path,
+             db_name,
+             generation,
++            upload_attempts,
+         )
+         .await
+         .context("failed to upload snapshot object");
+@@ -1307,6 +1382,7 @@ impl Replicator {
+         body_path: &Path,
+         db_name: &str,
+         generation: Uuid,
++        attempts: u32,
+     ) -> Result<()> {
+         let mut attempt: u32 = 1;
+         loop {
+@@ -1322,16 +1398,17 @@ impl Replicator {
+                 Ok(_) => return Ok(()),
+                 Err(e) => e,
+             };
+-            if attempt >= SNAPSHOT_UPLOAD_ATTEMPTS {
++            if attempt >= attempts {
+                 return Err(err.into());
+             }
+-            let delay = SNAPSHOT_UPLOAD_RETRY_BASE_DELAY * 2u32.saturating_pow(attempt - 1);
++            let delay = (SNAPSHOT_UPLOAD_RETRY_BASE_DELAY * 2u32.saturating_pow(attempt - 1))
++                .min(SNAPSHOT_UPLOAD_RETRY_MAX_DELAY);
+             tracing::warn!(
+                 "Snapshot upload of db {} for generation {} failed (attempt {}/{}), retrying in {:?}: {:?}",
+                 db_name,
+                 generation,
+                 attempt,
+-                SNAPSHOT_UPLOAD_ATTEMPTS,
++                attempts,
+                 delay,
+                 err
+             );
+diff --git a/libsql-server/src/namespace/meta_store.rs b/libsql-server/src/namespace/meta_store.rs
+index 70b419ebe9446046ab7a24256067b4f7a19e5531..c3a47f33a83d0c4b351268056edba9d2aa25efae 100644
+--- a/libsql-server/src/namespace/meta_store.rs
++++ b/libsql-server/src/namespace/meta_store.rs
+@@ -129,6 +129,10 @@ pub async fn metastore_connection_maker(
+                 max_batch_interval: config.backup_interval,
+                 s3_max_parallelism: 32,
+                 s3_max_retries: 10,
++                s3_connect_timeout: None,
++                s3_attempt_timeout: None,
++                s3_stalled_stream_grace_period: None,
++                snapshot_upload_attempts: bottomless::replicator::SNAPSHOT_UPLOAD_ATTEMPTS,
+                 skip_snapshot: false,
+                 skip_shutdown_upload: false,
+             };
+diff --git a/libsql-server/src/test/bottomless.rs b/libsql-server/src/test/bottomless.rs
+index f5a0aae552490c7024948ba0540cd9fa70a783cf..0cfa2c8205b456e0a5e8e52b2e596ba2892a3a82 100644
+--- a/libsql-server/src/test/bottomless.rs
++++ b/libsql-server/src/test/bottomless.rs
+@@ -621,6 +621,8 @@ mod snapshot_pipeline {
+         fail_snapshot_puts: Arc<AtomicI64>,
+         /// Delay applied to snapshot PUTs, in milliseconds.
+         delay_snapshot_puts_ms: Arc<AtomicI64>,
++        /// Number of snapshot PUTs received so far.
++        snapshot_puts_seen: Arc<AtomicI64>,
+     }
+ 
+     /// An S3 implementation that delegates to the `s3s-fs` filesystem backend,
+@@ -659,6 +661,9 @@ mod snapshot_pipeline {
+             req: S3Request<PutObjectInput>,
+         ) -> S3Result<S3Response<PutObjectOutput>> {
+             if is_snapshot_key(&req.input.key) {
++                self.injector
++                    .snapshot_puts_seen
++                    .fetch_add(1, Ordering::SeqCst);
+                 let delay = self.injector.delay_snapshot_puts_ms.load(Ordering::SeqCst);
+                 if delay > 0 {
+                     sleep(Duration::from_millis(delay as u64)).await;
+@@ -768,6 +773,10 @@ mod snapshot_pipeline {
+             // injected failures must surface to bottomless instead of being
+             // absorbed by the SDK's internal retries
+             s3_max_retries: 1,
++            s3_connect_timeout: None,
++            s3_attempt_timeout: None,
++            s3_stalled_stream_grace_period: None,
++            snapshot_upload_attempts: bottomless::replicator::SNAPSHOT_UPLOAD_ATTEMPTS,
+             skip_snapshot: false,
+             skip_shutdown_upload: false,
+         }
+@@ -1189,4 +1198,82 @@ mod snapshot_pipeline {
+ 
+         restarted.shutdown_gracefully().await.unwrap();
+     }
++
++    /// A snapshot upload whose request is accepted but never answered is cut
++    /// off by the S3 attempt timeout and retried, instead of leaving the
++    /// generation without a snapshot for as long as the connection survives.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn hung_snapshot_upload_times_out_and_is_retried() {
++        let _ = tracing_subscriber::fmt::try_init();
++
++        const DB_ID: &str = "testsnapshothang";
++        const BUCKET: &str = "testsnapshothang";
++        const PATH: &str = "snapshot_hang.sqld";
++        const PORT: u16 = 9085;
++
++        let injector = S3FailureInjector::default();
++        start_flaky_s3_server(PORT, injector.clone()).await;
++        let mut options = flaky_s3_options(DB_ID, BUCKET, PORT);
++        options.s3_attempt_timeout = Some(Duration::from_secs(1));
++
++        let _cleaner = DbFileCleaner::new(PATH);
++        let replicator = init_replicator(Path::new(PATH), &options).await;
++        let replicator = Arc::new(tokio::sync::Mutex::new(Some(replicator)));
++        let conn = open_bottomless_conn(Path::new(PATH), replicator.clone()).await;
++
++        let conn = exec(
++            conn,
++            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
++             INSERT INTO t(v) VALUES ('a');",
++        )
++        .await;
++
++        // the first snapshot PUT is held far longer than the test may run;
++        // once it is in, later PUTs are answered right away
++        injector
++            .delay_snapshot_puts_ms
++            .store(600_000, Ordering::SeqCst);
++        let release = {
++            let injector = injector.clone();
++            tokio::spawn(async move {
++                while injector.snapshot_puts_seen.load(Ordering::SeqCst) == 0 {
++                    sleep(Duration::from_millis(10)).await;
++                }
++                injector.delay_snapshot_puts_ms.store(0, Ordering::SeqCst);
++            })
++        };
++
++        let (conn, checkpointed) = try_checkpoint(conn).await;
++        assert!(checkpointed, "checkpoint of a fresh database must succeed");
++
++        let generation = {
++            let mut guard = replicator.lock().await;
++            let replicator = guard.as_mut().unwrap();
++            let generation = replicator.generation().unwrap();
++            let snapshotted =
++                tokio::time::timeout(Duration::from_secs(30), replicator.wait_until_snapshotted())
++                    .await
++                    .expect("the hung snapshot upload must be cut off by the attempt timeout")
++                    .unwrap();
++            assert!(
++                snapshotted,
++                "snapshot upload must succeed after the hung attempt"
++            );
++            generation
++        };
++        release.await.unwrap();
++        assert!(
++            injector.snapshot_puts_seen.load(Ordering::SeqCst) >= 2,
++            "the hung snapshot PUT must have been retried"
++        );
++
++        let client = assertion_client(PORT).await;
++        let snapshot_key = format!("{DB_ID}-{generation}/db.gz");
++        assert!(
++            object_exists(&client, BUCKET, &snapshot_key).await,
++            "snapshot object {snapshot_key} must exist after the retried upload"
++        );
++
++        close_conn(conn).await;
++    }
+ }

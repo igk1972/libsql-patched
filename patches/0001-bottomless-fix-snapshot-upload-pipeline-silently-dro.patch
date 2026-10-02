@@ -1,0 +1,1242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 24 Jul 2026 14:03:44 +0000
+Subject: [PATCH] bottomless: fix snapshot upload pipeline silently dropping
+ generation snapshots
+
+The continuous-backup pipeline could run for days while every generation it
+created was missing its base snapshot in object storage, degrading or breaking
+restore, and in one failure mode blocking checkpoints entirely so the WAL grew
+without bound. Five interacting defects:
+
+- A failed snapshot upload was never retried and blocked checkpoints until a
+  process restart: the snapshot task attempted its PutObject exactly once and
+  nothing ever re-ran it for the current generation, so the checkpoint gate
+  refused every subsequent checkpoint with SQLITE_BUSY. The upload is now
+  retried with backoff inside the snapshot task (rebuilding the body stream
+  per attempt, so a retry never sends a stale Content-Length), and the
+  checkpoint gate re-triggers the snapshot of the current generation when it
+  failed or never ran. Re-uploading at any later point is correct because the
+  main database file only changes on a TRUNCATE checkpoint, and checkpoints
+  stay refused until the upload succeeds.
+
+- A checkpoint attempt that found an empty WAL unconditionally marked the
+  current generation as snapshotted, laundering failed or still-in-flight
+  uploads into success markers and letting the next checkpoint rotate the
+  generation while leaving no snapshot of it behind. The empty-WAL branch now
+  re-triggers a missing snapshot instead of overwriting the failure state.
+
+- Concurrent snapshot tasks compressed the database into the same fixed
+  db.gz/db.zstd path with truncate(true), shrinking the file under the other
+  task's in-flight upload stream (surfacing as hyper BodyWriteAborted/NotEof
+  dispatch failures) or silently uploading a torn object. Compression now
+  targets a per-generation artifact path, an in-flight flag guarantees at most
+  one snapshot task at a time, and stale artifacts (including legacy
+  fixed-name ones) are swept only while no upload is running. S3 object keys
+  are unchanged.
+
+- The AWS SDK's stalled-stream protection aborted slow snapshot uploads: a
+  whole-database PutObject can run for minutes and legitimately stalls beyond
+  the ~5s grace period whenever the process is busy, and the watchdog abort
+  surfaces as the same BodyWriteAborted signature. The watchdog is now
+  disabled on the bottomless client; bottomless owns its retry policy.
+
+- Restarting on top of a non-empty database file created a generation with no
+  .dep parent link, severing the chain that restore walks when a generation
+  has no snapshot: compare_with_local returned early before storing the
+  generation it compared against. The store now happens before the early
+  return.
+
+Snapshot upload log lines now include the database name and generation.
+
+Tests: new snapshot_pipeline regression tests in libsql-server drive the
+bottomless WAL wrapper against a mock S3 server with failure injection,
+covering upload retry, checkpoint recovery without restart (including the
+empty-WAL laundering case), the snapshot overlap guard, and the .dep link on
+restart. Existing bottomless tests pass, including the ignored backup_restore
+test.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013Q5tV6oA1zXfrWhchz2Cqk
+---
+ .gitignore                           |   4 +
+ bottomless/src/bottomless_wal.rs     |  34 +-
+ bottomless/src/replicator.rs         | 326 ++++++++++----
+ libsql-server/src/test/bottomless.rs | 613 +++++++++++++++++++++++++++
+ 4 files changed, 899 insertions(+), 78 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index f40057e543faebe04008e66658f2efd371e9594f..2af81b93bc79841287991e700bd233293cd615c9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -5,6 +5,10 @@
+ 
+ libsql-server/testrollbackrestore/**
+ libsql-server/testbackuprestore/**
++libsql-server/testsnapshotretry/**
++libsql-server/testsnapshotwedge/**
++libsql-server/testsnapshotoverlap/**
++libsql-server/testsnapshotdep/**
+ libsql-sqlite3/**.o.tmp
+ /libsql-ffi/bundled/SQLite3MultipleCiphers/build/**
+ # will be copied from bundled/src
+diff --git a/bottomless/src/bottomless_wal.rs b/bottomless/src/bottomless_wal.rs
+index 98fd59ce16c02f8110c2b80aaa9d4fd50c16e39b..7afb5385b1e92ddde458847e6c5f81c931c1ed10 100644
+--- a/bottomless/src/bottomless_wal.rs
++++ b/bottomless/src/bottomless_wal.rs
+@@ -32,6 +32,28 @@ impl BottomlessWalWrapper {
+     }
+ }
+ 
++/// Returns true if the current generation's snapshot upload has completed.
++/// When the upload failed, or was never started (e.g. it was interrupted by a
++/// process restart or a crashed task), it is re-triggered so that the backup
++/// pipeline heals itself instead of refusing checkpoints until the process is
++/// restarted. Re-uploading the snapshot of the current generation at any later
++/// point in time is correct: the main database file only changes on a TRUNCATE
++/// checkpoint, and checkpoints are refused until the snapshot upload succeeds.
++async fn ensure_snapshotted(replicator: &mut Replicator) -> bool {
++    if replicator.is_snapshotted().await {
++        return true;
++    }
++    if replicator.snapshot_in_flight() {
++        tracing::debug!("snapshot upload for the current generation is still in flight");
++    } else {
++        tracing::warn!("current generation is missing its snapshot, re-triggering snapshot");
++        if let Err(e) = replicator.snapshot_main_db_file(false).await {
++            tracing::error!("failed to re-trigger a snapshot upload: {e}");
++        }
++    }
++    false
++}
++
+ impl<T: Wal> WrapWal<T> for BottomlessWalWrapper {
+     fn savepoint_undo(
+         &mut self,
+@@ -136,7 +158,14 @@ impl<T: Wal> WrapWal<T> for BottomlessWalWrapper {
+                         tracing::debug!(
+                             "No committed changes in this generation, not snapshotting"
+                         );
+-                        replicator.skip_snapshot_for_current_generation();
++                        // The checkpoint is skipped, but the current generation
++                        // still needs its snapshot for the next checkpoint to be
++                        // allowed, so re-trigger it here if it failed. The failed
++                        // state must never be overwritten with a success marker:
++                        // that would let the next checkpoint rotate the generation
++                        // while leaving no snapshot of it behind, silently
++                        // degrading restore.
++                        ensure_snapshotted(replicator).await;
+                         return Err(Error::new(SQLITE_BUSY));
+                     }
+ 
+@@ -163,8 +192,7 @@ impl<T: Wal> WrapWal<T> for BottomlessWalWrapper {
+                         }
+                     }
+                     tracing::debug!("commited after {:?}", before.elapsed());
+-                    let snapshotted = replicator.is_snapshotted().await;
+-                    if !snapshotted {
++                    if !ensure_snapshotted(replicator).await {
+                         tracing::warn!("previous generation not snapshotted, skipping checkpoint");
+                         return Err(Error::new(SQLITE_BUSY));
+                     }
+diff --git a/bottomless/src/replicator.rs b/bottomless/src/replicator.rs
+index 6f318fd125ba49090b1741dfaa14039c94bf5892..b6f7fd760c482563ecedbcf306b8a4987faf387d 100644
+--- a/bottomless/src/replicator.rs
++++ b/bottomless/src/replicator.rs
+@@ -3,11 +3,13 @@ use crate::completion_progress::{CompletionProgress, SavepointTracker};
+ use crate::read::BatchReader;
+ use crate::uuid_utils::decode_unix_timestamp;
+ use crate::wal::WalFileReader;
+-use anyhow::{anyhow, bail};
++use anyhow::{anyhow, bail, Context as _};
+ use arc_swap::ArcSwapOption;
+ use async_compression::tokio::write::{GzipEncoder, ZstdEncoder};
+ use aws_config::BehaviorVersion;
+-use aws_sdk_s3::config::{Credentials, Region, SharedCredentialsProvider};
++use aws_sdk_s3::config::{
++    Credentials, Region, SharedCredentialsProvider, StalledStreamProtectionConfig,
++};
+ use aws_sdk_s3::error::SdkError;
+ use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
+ use aws_sdk_s3::operation::get_object::GetObjectError;
+@@ -24,7 +26,7 @@ use metrics::{counter, gauge, histogram};
+ use std::ops::Deref;
+ use std::path::{Path, PathBuf};
+ use std::str::FromStr;
+-use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ use std::sync::Arc;
+ use tokio::fs::{File, OpenOptions};
+ use tokio::io::AsyncWriteExt;
+@@ -41,6 +43,15 @@ use uuid::{NoContext, Uuid};
+ /// consecutive generations has to have a snapshot included.
+ const MAX_RESTORE_STACK_DEPTH: usize = 100;
+ 
++/// Maximum number of attempts for the snapshot upload of a single generation.
++/// A snapshot upload streams the whole (compressed) database file in a single
++/// request that may run for minutes; if its body stream is aborted mid-flight
++/// the SDK cannot retry the request on its own, so the snapshot task rebuilds
++/// the request from scratch and tries again.
++const SNAPSHOT_UPLOAD_ATTEMPTS: u32 = 3;
++/// Base delay between snapshot upload attempts, doubled on every retry.
++const SNAPSHOT_UPLOAD_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
++
+ pub type Result<T> = anyhow::Result<T>;
+ 
+ #[derive(Debug)]
+@@ -59,6 +70,12 @@ pub struct Replicator {
+     shutdown_trigger: Option<tokio::sync::watch::Sender<()>>,
+     snapshot_waiter: Receiver<Result<Option<Uuid>>>,
+     snapshot_notifier: Arc<Sender<Result<Option<Uuid>>>>,
++    /// Set while a snapshot upload task is running. Guarantees that at most one
++    /// snapshot task exists at a time, so concurrent tasks can never interfere
++    /// with each other's upload streams, and lets checkpoints distinguish "the
++    /// snapshot is still uploading" from "the snapshot failed and has to be
++    /// re-triggered".
++    snapshot_in_flight: Arc<AtomicBool>,
+ 
+     pub page_size: usize,
+     generation: Arc<ArcSwapOption<Uuid>>,
+@@ -78,6 +95,18 @@ pub struct Replicator {
+     skip_shutdown_upload: bool,
+ }
+ 
++/// Clears the "snapshot upload in flight" flag when dropped. Dropping (rather
++/// than storing directly at the end of the snapshot task) makes sure the flag
++/// is cleared even when the task panics, so a later checkpoint attempt can
++/// re-trigger the snapshot instead of waiting forever.
++struct SnapshotInFlightGuard(Arc<AtomicBool>);
++
++impl Drop for SnapshotInFlightGuard {
++    fn drop(&mut self) {
++        self.0.store(false, Ordering::Release);
++    }
++}
++
+ #[derive(Debug)]
+ pub struct FetchedResults {
+     pub pages: Vec<(i32, Bytes)>,
+@@ -163,6 +192,14 @@ impl Options {
+ 
+         let s3_config = aws_sdk_s3::config::Builder::from(&conf)
+             .force_path_style(true)
++            // The SDK's stalled-stream protection aborts uploads whose body
++            // stream stays below a minimum throughput for a ~5s grace period.
++            // A snapshot upload streams the whole database file in a single
++            // request that can run for many minutes and legitimately stalls
++            // when the process is busy (e.g. while compressing another
++            // database's snapshot), which would get it killed mid-flight.
++            // Bottomless owns its retry policy, so the watchdog is disabled.
++            .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+             .build();
+ 
+         Ok(s3_config)
+@@ -504,6 +541,7 @@ impl Replicator {
+             db_name,
+             snapshot_waiter,
+             snapshot_notifier: Arc::new(snapshot_notifier),
++            snapshot_in_flight: Arc::new(AtomicBool::new(false)),
+             use_compression: options.use_compression,
+             encryption_config: options.encryption_config,
+             max_frames_per_batch: options.max_frames_per_batch,
+@@ -596,6 +634,11 @@ impl Replicator {
+         self.use_compression
+     }
+ 
++    /// Returns true while a snapshot upload task is running.
++    pub fn snapshot_in_flight(&self) -> bool {
++        self.snapshot_in_flight.load(Ordering::Acquire)
++    }
++
+     pub async fn is_snapshotted(&mut self) -> bool {
+         if let Ok(generation) = self.generation() {
+             if !self.main_db_exists_and_not_empty().await {
+@@ -954,20 +997,23 @@ impl Replicator {
+         Ok(page_size)
+     }
+ 
+-    // Returns the compressed database file path and its change counter, extracted
+-    // from the header of page1 at offset 24..27 (as per SQLite documentation).
++    // Compresses the main database file into a snapshot artifact unique to the
++    // given generation and returns the path of the file that should be
++    // uploaded. With compression disabled the database file itself is
++    // returned.
+     pub async fn maybe_compress_main_db_file(
+         db_path: &Path,
++        generation: &Uuid,
+         compression: CompressionKind,
+-    ) -> Result<ByteStream> {
++    ) -> Result<PathBuf> {
+         if !tokio::fs::try_exists(db_path).await? {
+             bail!("database file was not found at `{}`", db_path.display())
+         }
+         match compression {
+-            CompressionKind::None => Ok(ByteStream::from_path(db_path).await?),
++            CompressionKind::None => Ok(db_path.to_path_buf()),
+             CompressionKind::Gzip => {
+                 let mut reader = File::open(db_path).await?;
+-                let gzip_path = Self::db_compressed_path(db_path, "gz");
++                let gzip_path = Self::db_compressed_path(db_path, generation, "gz");
+                 let compressed_file = OpenOptions::new()
+                     .create(true)
+                     .write(true)
+@@ -983,11 +1029,11 @@ impl Replicator {
+                     size,
+                     gzip_path.display()
+                 );
+-                Ok(ByteStream::from_path(gzip_path).await?)
++                Ok(gzip_path)
+             }
+             CompressionKind::Zstd => {
+                 let mut reader = File::open(db_path).await?;
+-                let zstd_path = Self::db_compressed_path(db_path, "zstd");
++                let zstd_path = Self::db_compressed_path(db_path, generation, "zstd");
+                 let compressed_file = OpenOptions::new()
+                     .create(true)
+                     .write(true)
+@@ -1003,15 +1049,59 @@ impl Replicator {
+                     size,
+                     zstd_path.display()
+                 );
+-                Ok(ByteStream::from_path(zstd_path).await?)
++                Ok(zstd_path)
+             }
+         }
+     }
+ 
+-    fn db_compressed_path(db_path: &Path, suffix: &'static str) -> PathBuf {
++    // Path of the compressed snapshot artifact for the given generation. The
++    // path is unique per generation so that a snapshot task can never observe
++    // its file being truncated or rewritten by another snapshot task.
++    fn db_compressed_path(db_path: &Path, generation: &Uuid, suffix: &'static str) -> PathBuf {
+         let mut compressed_path: PathBuf = db_path.to_path_buf();
+         compressed_path.pop();
+-        compressed_path.join(format!("db.{suffix}"))
++        compressed_path.join(format!("db.{generation}.{suffix}"))
++    }
++
++    // Removes leftover snapshot artifacts: per-generation `db.<uuid>.gz|zstd`
++    // files from interrupted runs as well as fixed-name `db.gz|db.zstd` files
++    // written by older versions. Must only be called while no snapshot upload
++    // is in flight.
++    async fn remove_stale_snapshot_artifacts(db_path: &Path) {
++        fn is_snapshot_artifact(name: &str) -> bool {
++            let Some(rest) = name.strip_prefix("db.") else {
++                return false;
++            };
++            match rest {
++                "gz" | "zstd" => true,
++                _ => rest
++                    .strip_suffix(".gz")
++                    .or_else(|| rest.strip_suffix(".zstd"))
++                    .map(|generation| Uuid::parse_str(generation).is_ok())
++                    .unwrap_or(false),
++            }
++        }
++
++        let dir = match db_path.parent() {
++            Some(dir) if !dir.as_os_str().is_empty() => dir,
++            _ => Path::new("."),
++        };
++        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
++            return;
++        };
++        while let Ok(Some(entry)) = entries.next_entry().await {
++            let name = entry.file_name();
++            let Some(name) = name.to_str() else {
++                continue;
++            };
++            if is_snapshot_artifact(name) {
++                tracing::debug!(
++                    "removing stale snapshot artifact `{}`",
++                    entry.path().display()
++                );
++                let _ = tokio::fs::remove_file(entry.path()).await;
++            }
++        }
+     }
+ 
+     fn restore_db_path(&self) -> PathBuf {
+@@ -1064,11 +1154,6 @@ impl Replicator {
+         }
+     }
+ 
+-    pub fn skip_snapshot_for_current_generation(&self) {
+-        let generation = self.generation.load().as_deref().cloned();
+-        let _ = self.snapshot_notifier.send(Ok(generation));
+-    }
+-
+     // Sends the main database file to S3 - if -wal file is present, it's replicated
+     // too - it means that the local file was detected to be newer than its remote
+     // counterpart.
+@@ -1089,76 +1174,63 @@ impl Replicator {
+             return Ok(None);
+         }
+         let generation = self.generation()?;
++        if self.snapshot_in_flight.swap(true, Ordering::AcqRel) {
++            tracing::warn!(
++                "not snapshotting generation {} of db {}: another snapshot upload is in flight",
++                generation,
++                self.db_name
++            );
++            return Ok(None);
++        }
++        let in_flight = SnapshotInFlightGuard(self.snapshot_in_flight.clone());
+         let start_ts = Instant::now();
+         let client = self.client.clone();
+         let change_counter = self.read_change_counter()?;
+-        let snapshot_req = client.put_object().bucket(self.bucket.clone()).key(format!(
+-            "{}-{}/db.{}",
+-            self.db_name, generation, self.use_compression
+-        ));
+-
+-        /* FIXME: we can't rely on the change counter in WAL mode:
+-         ** "In WAL mode, changes to the database are detected using the wal-index and
+-         ** so the change counter is not needed. Hence, the change counter might not be
+-         ** incremented on each transaction in WAL mode."
+-         ** Instead, we need to consult WAL checksums.
+-         */
+-        let change_counter_key = format!("{}-{}/.changecounter", self.db_name, generation);
+-        let change_counter_req = self
+-            .client
+-            .put_object()
+-            .bucket(&self.bucket)
+-            .key(change_counter_key)
+-            .body(ByteStream::from(Bytes::copy_from_slice(
+-                change_counter.as_ref(),
+-            )));
+         let snapshot_notifier = self.snapshot_notifier.clone();
+         let compression = self.use_compression;
+         let db_path = PathBuf::from(self.db_path.clone());
+         let db_name = self.db_name.clone();
++        let bucket = self.bucket.clone();
+         let handle = tokio::spawn(async move {
+             tracing::trace!("Start snapshotting generation {}", generation);
+             let start = Instant::now();
+-            let body = match Self::maybe_compress_main_db_file(&db_path, compression).await {
+-                Ok(file) => file,
++            let result = {
++                // the guard is dropped (and the in-flight flag cleared) before
++                // the notifier is updated, so observers of a settled snapshot
++                // state never race with an alive snapshot task
++                let _in_flight = in_flight;
++                Self::upload_snapshot(
++                    client,
++                    bucket,
++                    &db_path,
++                    &db_name,
++                    generation,
++                    compression,
++                    change_counter,
++                )
++                .await
++            };
++            match result {
++                Ok(()) => {
++                    let _ = snapshot_notifier.send(Ok(Some(generation)));
++                    let elapsed = Instant::now() - start;
++                    tracing::info!(
++                        "Snapshot upload of db {} for generation {} finished (took {:?})",
++                        db_name,
++                        generation,
++                        elapsed
++                    );
++                    Self::record_snapshot_upload_time(&db_name, elapsed);
++                }
+                 Err(e) => {
+                     tracing::error!(
+-                        "Failed to compress db file (generation `{}`, path: `{}`): {:?}",
++                        "Failed to upload snapshot of db {} for generation {}: {:?}",
++                        db_name,
+                         generation,
+-                        db_path.display(),
+                         e
+                     );
+                     let _ = snapshot_notifier.send(Err(e));
+-                    return;
+                 }
+-            };
+-            let mut result = snapshot_req.body(body).send().await;
+-            if let Err(e) = result {
+-                tracing::error!(
+-                    "Failed to upload snapshot for generation {}: {:?}",
+-                    generation,
+-                    e
+-                );
+-                let _ = snapshot_notifier.send(Err(e.into()));
+-                return;
+-            }
+-            result = change_counter_req.send().await;
+-            if let Err(e) = result {
+-                tracing::error!(
+-                    "Failed to upload change counter for generation {}: {:?}",
+-                    generation,
+-                    e
+-                );
+-                let _ = snapshot_notifier.send(Err(e.into()));
+-                return;
+-            }
+-            let _ = snapshot_notifier.send(Ok(Some(generation)));
+-            let elapsed = Instant::now() - start;
+-            tracing::info!("Snapshot upload finished (took {:?})", elapsed);
+-            Self::record_snapshot_upload_time(&db_name, elapsed);
+-            // cleanup gzip/zstd database snapshot if exists
+-            for suffix in &["gz", "zstd"] {
+-                let _ = tokio::fs::remove_file(Self::db_compressed_path(&db_path, suffix)).await;
+             }
+         });
+         let elapsed = Instant::now() - start_ts;
+@@ -1167,6 +1239,107 @@ impl Replicator {
+         Ok(Some(handle))
+     }
+ 
++    // Body of the snapshot upload task: compresses the main database file and
++    // uploads it together with its change counter marker.
++    async fn upload_snapshot(
++        client: Client,
++        bucket: String,
++        db_path: &Path,
++        db_name: &str,
++        generation: Uuid,
++        compression: CompressionKind,
++        change_counter: [u8; 4],
++    ) -> Result<()> {
++        // no other snapshot task is in flight, so any artifact still on disk is
++        // a leftover of a previous (interrupted) run
++        Self::remove_stale_snapshot_artifacts(db_path).await;
++        let body_path = Self::maybe_compress_main_db_file(db_path, &generation, compression)
++            .await
++            .with_context(|| {
++                format!("failed to compress db file (path: `{}`)", db_path.display())
++            })?;
++        let snapshot_key = format!("{}-{}/db.{}", db_name, generation, compression);
++        let result = Self::put_snapshot_object(
++            &client,
++            &bucket,
++            &snapshot_key,
++            &body_path,
++            db_name,
++            generation,
++        )
++        .await
++        .context("failed to upload snapshot object");
++        // remove the compressed artifact regardless of the upload outcome: a
++        // re-triggered snapshot recompresses it from the main database file
++        if body_path != db_path {
++            let _ = tokio::fs::remove_file(&body_path).await;
++        }
++        result?;
++
++        /* FIXME: we can't rely on the change counter in WAL mode:
++         ** "In WAL mode, changes to the database are detected using the wal-index and
++         ** so the change counter is not needed. Hence, the change counter might not be
++         ** incremented on each transaction in WAL mode."
++         ** Instead, we need to consult WAL checksums.
++         */
++        let change_counter_key = format!("{}-{}/.changecounter", db_name, generation);
++        client
++            .put_object()
++            .bucket(&bucket)
++            .key(change_counter_key)
++            .body(ByteStream::from(Bytes::copy_from_slice(
++                change_counter.as_ref(),
++            )))
++            .send()
++            .await
++            .context("failed to upload change counter object")?;
++        Ok(())
++    }
++
++    // Uploads the snapshot object, retrying a bounded number of times with
++    // backoff. The request body is rebuilt from the file on every attempt:
++    // its length is captured at creation time and sent as Content-Length, and
++    // a partially consumed stream cannot be replayed by the SDK.
++    async fn put_snapshot_object(
++        client: &Client,
++        bucket: &str,
++        key: &str,
++        body_path: &Path,
++        db_name: &str,
++        generation: Uuid,
++    ) -> Result<()> {
++        let mut attempt: u32 = 1;
++        loop {
++            let body = ByteStream::from_path(body_path).await?;
++            let err = match client
++                .put_object()
++                .bucket(bucket)
++                .key(key)
++                .body(body)
++                .send()
++                .await
++            {
++                Ok(_) => return Ok(()),
++                Err(e) => e,
++            };
++            if attempt >= SNAPSHOT_UPLOAD_ATTEMPTS {
++                return Err(err.into());
++            }
++            let delay = SNAPSHOT_UPLOAD_RETRY_BASE_DELAY * 2u32.saturating_pow(attempt - 1);
++            tracing::warn!(
++                "Snapshot upload of db {} for generation {} failed (attempt {}/{}), retrying in {:?}: {:?}",
++                db_name,
++                generation,
++                attempt,
++                SNAPSHOT_UPLOAD_ATTEMPTS,
++                delay,
++                err
++            );
++            tokio::time::sleep(delay).await;
++            attempt += 1;
++        }
++    }
++
+     // Returns newest replicated generation, or None, if one is not found.
+     // FIXME: assumes that this bucket stores *only* generations for databases,
+     // it should be more robust and continue looking if the first item does not
+@@ -1453,6 +1626,13 @@ impl Replicator {
+         generation: Uuid,
+         last_consistent_frame: u32,
+     ) -> Result<Option<RestoreAction>> {
++        // We impersonate as a given generation, since we're comparing against local backup at that
++        // generation. This is used later in [Self::new_generation] to create a dependency between
++        // this generation and a new one. It must happen before any early return that requests a
++        // new generation to be made, otherwise the new generation is created with no `.dep` link
++        // to its predecessor and the restore chain is severed.
++        self.generation.store(Some(Arc::new(generation)));
++
+         // Check if the database needs to be restored by inspecting the database
+         // change counter and the WAL size.
+         let local_counter = self.read_change_counter().unwrap_or([0u8; 4]);
+@@ -1466,10 +1646,6 @@ impl Replicator {
+         tracing::debug!("Counters: l={:?}, r={:?}", local_counter, remote_counter);
+ 
+         let wal_pages = self.get_local_wal_page_count().await;
+-        // We impersonate as a given generation, since we're comparing against local backup at that
+-        // generation. This is used later in [Self::new_generation] to create a dependency between
+-        // this generation and a new one.
+-        self.generation.store(Some(Arc::new(generation)));
+         match local_counter.cmp(&remote_counter) {
+             std::cmp::Ordering::Equal => {
+                 tracing::debug!(
+diff --git a/libsql-server/src/test/bottomless.rs b/libsql-server/src/test/bottomless.rs
+index f2f23583c2ffb4f726a5894b4703936264ef3b08..f5a0aae552490c7024948ba0540cd9fa70a783cf 100644
+--- a/libsql-server/src/test/bottomless.rs
++++ b/libsql-server/src/test/bottomless.rs
+@@ -577,3 +577,616 @@ impl Drop for S3BucketCleaner {
+         //let _ = block_on(Self::cleanup(self.0));
+     }
+ }
++
++/// Regression tests for the snapshot upload pipeline: a failed or interrupted
++/// snapshot upload must not wedge checkpoints until a process restart, must
++/// never be laundered into a success marker, and a process restart must link
++/// the new generation to its predecessor with a `.dep` object.
++///
++/// These tests drive the bottomless WAL wrapper through a raw libsql
++/// connection (the same wiring the meta store uses) against a per-test mock
++/// S3 server that can inject failures into snapshot uploads.
++mod snapshot_pipeline {
++    use super::*;
++
++    use std::path::Path;
++    use std::sync::atomic::{AtomicI64, Ordering};
++    use std::sync::Arc;
++
++    use bottomless::bottomless_wal::BottomlessWalWrapper;
++    use bottomless::replicator::Replicator;
++    use libsql_sys::wal::wrapper::{WalWrapper, WrappedWal};
++    use libsql_sys::wal::{Sqlite3Wal, Sqlite3WalManager};
++    use s3s::dto::{
++        CreateBucketInput, CreateBucketOutput, DeleteObjectInput, DeleteObjectOutput,
++        DeleteObjectsInput, DeleteObjectsOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
++        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListObjectsInput, ListObjectsOutput,
++        ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput,
++    };
++    use s3s::{S3Request, S3Response, S3Result, S3};
++
++    use crate::connection::legacy::open_conn_active_checkpoint;
++
++    const FLAKY_S3_KEY: &str = "flaky-key";
++    const FLAKY_S3_SECRET: &str = "flaky-secret";
++
++    type BottomlessConn =
++        libsql_sys::Connection<WrappedWal<Option<BottomlessWalWrapper>, Sqlite3Wal>>;
++
++    #[derive(Clone, Default)]
++    struct S3FailureInjector {
++        /// Number of snapshot PUTs to fail: a positive value counts down with
++        /// every failed request, a negative value fails all snapshot PUTs and
++        /// zero disables the injection.
++        fail_snapshot_puts: Arc<AtomicI64>,
++        /// Delay applied to snapshot PUTs, in milliseconds.
++        delay_snapshot_puts_ms: Arc<AtomicI64>,
++    }
++
++    /// An S3 implementation that delegates to the `s3s-fs` filesystem backend,
++    /// but can inject failures into and delay snapshot uploads (PUT requests
++    /// of `db.*` objects).
++    struct FlakyS3 {
++        inner: s3s_fs::FileSystem,
++        injector: S3FailureInjector,
++    }
++
++    fn is_snapshot_key(key: &str) -> bool {
++        key.rsplit('/')
++            .next()
++            .map(|name| name.starts_with("db."))
++            .unwrap_or(false)
++    }
++
++    #[async_trait::async_trait]
++    impl S3 for FlakyS3 {
++        async fn create_bucket(
++            &self,
++            req: S3Request<CreateBucketInput>,
++        ) -> S3Result<S3Response<CreateBucketOutput>> {
++            self.inner.create_bucket(req).await
++        }
++
++        async fn head_bucket(
++            &self,
++            req: S3Request<HeadBucketInput>,
++        ) -> S3Result<S3Response<HeadBucketOutput>> {
++            self.inner.head_bucket(req).await
++        }
++
++        async fn put_object(
++            &self,
++            req: S3Request<PutObjectInput>,
++        ) -> S3Result<S3Response<PutObjectOutput>> {
++            if is_snapshot_key(&req.input.key) {
++                let delay = self.injector.delay_snapshot_puts_ms.load(Ordering::SeqCst);
++                if delay > 0 {
++                    sleep(Duration::from_millis(delay as u64)).await;
++                }
++                let remaining = self.injector.fail_snapshot_puts.load(Ordering::SeqCst);
++                if remaining != 0 {
++                    if remaining > 0 {
++                        self.injector
++                            .fail_snapshot_puts
++                            .fetch_sub(1, Ordering::SeqCst);
++                    }
++                    return Err(s3s::S3Error::with_message(
++                        s3s::S3ErrorCode::InternalError,
++                        "injected snapshot upload failure",
++                    ));
++                }
++            }
++            self.inner.put_object(req).await
++        }
++
++        async fn get_object(
++            &self,
++            req: S3Request<GetObjectInput>,
++        ) -> S3Result<S3Response<GetObjectOutput>> {
++            self.inner.get_object(req).await
++        }
++
++        async fn head_object(
++            &self,
++            req: S3Request<HeadObjectInput>,
++        ) -> S3Result<S3Response<HeadObjectOutput>> {
++            self.inner.head_object(req).await
++        }
++
++        async fn list_objects(
++            &self,
++            req: S3Request<ListObjectsInput>,
++        ) -> S3Result<S3Response<ListObjectsOutput>> {
++            self.inner.list_objects(req).await
++        }
++
++        async fn list_objects_v2(
++            &self,
++            req: S3Request<ListObjectsV2Input>,
++        ) -> S3Result<S3Response<ListObjectsV2Output>> {
++            self.inner.list_objects_v2(req).await
++        }
++
++        async fn delete_object(
++            &self,
++            req: S3Request<DeleteObjectInput>,
++        ) -> S3Result<S3Response<DeleteObjectOutput>> {
++            self.inner.delete_object(req).await
++        }
++
++        async fn delete_objects(
++            &self,
++            req: S3Request<DeleteObjectsInput>,
++        ) -> S3Result<S3Response<DeleteObjectsOutput>> {
++            self.inner.delete_objects(req).await
++        }
++    }
++
++    async fn start_flaky_s3_server(port: u16, injector: S3FailureInjector) {
++        let tmp = std::env::temp_dir().join(format!("s3s-flaky-{}", Uuid::new_v4().as_simple()));
++        std::fs::create_dir_all(&tmp).unwrap();
++        let s3_impl = FlakyS3 {
++            inner: s3s_fs::FileSystem::new(tmp).unwrap(),
++            injector,
++        };
++        let auth = SimpleAuth::from_single(FLAKY_S3_KEY, FLAKY_S3_SECRET);
++        let mut s3 = S3ServiceBuilder::new(s3_impl);
++        s3.set_auth(auth);
++        let s3 = s3.build().into_shared().into_make_service();
++        tokio::spawn(async move {
++            let addr = ([127, 0, 0, 1], port).into();
++            hyper::Server::bind(&addr).serve(s3).await.unwrap();
++        });
++        for _ in 0..100 {
++            if tokio::net::TcpStream::connect(("127.0.0.1", port))
++                .await
++                .is_ok()
++            {
++                return;
++            }
++            sleep(Duration::from_millis(50)).await;
++        }
++        panic!("mock s3 server did not start on port {port}");
++    }
++
++    fn flaky_s3_options(db_id: &str, bucket: &str, port: u16) -> bottomless::replicator::Options {
++        bottomless::replicator::Options {
++            db_id: Some(db_id.to_string()),
++            create_bucket_if_not_exists: true,
++            verify_crc: true,
++            use_compression: bottomless::replicator::CompressionKind::Gzip,
++            encryption_config: None,
++            aws_endpoint: Some(format!("http://localhost:{port}")),
++            access_key_id: Some(FLAKY_S3_KEY.to_string()),
++            secret_access_key: Some(FLAKY_S3_SECRET.to_string()),
++            session_token: None,
++            region: Some("us-east-1".to_string()),
++            bucket_name: bucket.to_string(),
++            max_frames_per_batch: 10_000,
++            max_batch_interval: Duration::from_millis(250),
++            s3_max_parallelism: 32,
++            // injected failures must surface to bottomless instead of being
++            // absorbed by the SDK's internal retries
++            s3_max_retries: 1,
++            skip_snapshot: false,
++            skip_shutdown_upload: false,
++        }
++    }
++
++    async fn assertion_client(port: u16) -> Client {
++        let loader = aws_config::from_env().endpoint_url(format!("http://localhost:{port}"));
++        let conf = aws_sdk_s3::config::Builder::from(&loader.load().await)
++            .force_path_style(true)
++            .region(Region::new("us-east-1"))
++            .credentials_provider(Credentials::new(
++                FLAKY_S3_KEY,
++                FLAKY_S3_SECRET,
++                None,
++                None,
++                "Static",
++            ))
++            .build();
++        Client::from_conf(conf)
++    }
++
++    async fn object_exists(client: &Client, bucket: &str, key: &str) -> bool {
++        client
++            .get_object()
++            .bucket(bucket)
++            .key(key)
++            .send()
++            .await
++            .is_ok()
++    }
++
++    /// Mirrors the replicator initialization performed by
++    /// `init_bottomless_replicator` in `namespace/configurator/helpers.rs`.
++    async fn init_replicator(
++        db_dir: &Path,
++        options: &bottomless::replicator::Options,
++    ) -> Replicator {
++        tokio::fs::create_dir_all(db_dir).await.unwrap();
++        let db_file = db_dir.join("data");
++        let mut replicator = Replicator::with_options(db_file.to_str().unwrap(), options.clone())
++            .await
++            .unwrap();
++        let (action, _did_recover) = replicator.restore(None, None).await.unwrap();
++        match action {
++            bottomless::replicator::RestoreAction::SnapshotMainDbFile => {
++                replicator.new_generation().await;
++                replicator.snapshot_main_db_file(true).await.unwrap();
++                replicator.maybe_replicate_wal().await.unwrap();
++            }
++            bottomless::replicator::RestoreAction::ReuseGeneration(gen) => {
++                replicator.set_generation(gen);
++            }
++        }
++        replicator
++    }
++
++    /// Opens a connection whose WAL is wrapped by the bottomless wrapper, the
++    /// same way the meta store wires it up. Autocheckpoint is disabled, like
++    /// on a primary configured with a checkpoint interval.
++    async fn open_bottomless_conn(
++        db_dir: &Path,
++        replicator: Arc<tokio::sync::Mutex<Option<Replicator>>>,
++    ) -> BottomlessConn {
++        let wal_manager = WalWrapper::new(
++            Some(BottomlessWalWrapper::new(replicator)),
++            Sqlite3WalManager::default(),
++        );
++        let db_dir = db_dir.to_path_buf();
++        tokio::task::spawn_blocking(move || {
++            open_conn_active_checkpoint(&db_dir, wal_manager, None, 0, None).unwrap()
++        })
++        .await
++        .unwrap()
++    }
++
++    /// Connection methods must run on a blocking thread: the bottomless WAL
++    /// hooks use `blocking_lock`/`block_on` internally.
++    async fn exec(conn: BottomlessConn, sql: &'static str) -> BottomlessConn {
++        tokio::task::spawn_blocking(move || {
++            conn.execute_batch(sql).unwrap();
++            conn
++        })
++        .await
++        .unwrap()
++    }
++
++    /// Attempts a TRUNCATE checkpoint. Returns true when the checkpoint was
++    /// performed and false when it was refused (busy).
++    async fn try_checkpoint(conn: BottomlessConn) -> (BottomlessConn, bool) {
++        tokio::task::spawn_blocking(move || {
++            let busy: i64 = conn
++                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", (), |row| row.get(0))
++                .unwrap();
++            (conn, busy == 0)
++        })
++        .await
++        .unwrap()
++    }
++
++    async fn close_conn(conn: BottomlessConn) {
++        tokio::task::spawn_blocking(move || drop(conn))
++            .await
++            .unwrap()
++    }
++
++    /// A snapshot upload that fails is retried within the snapshot task, so a
++    /// transient error does not leave the generation without its snapshot.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn snapshot_upload_is_retried() {
++        let _ = tracing_subscriber::fmt::try_init();
++
++        const DB_ID: &str = "testsnapshotretry";
++        const BUCKET: &str = "testsnapshotretry";
++        const PATH: &str = "snapshot_retry.sqld";
++        const PORT: u16 = 9081;
++
++        let injector = S3FailureInjector::default();
++        start_flaky_s3_server(PORT, injector.clone()).await;
++        let options = flaky_s3_options(DB_ID, BUCKET, PORT);
++
++        let _cleaner = DbFileCleaner::new(PATH);
++        let replicator = init_replicator(Path::new(PATH), &options).await;
++        let replicator = Arc::new(tokio::sync::Mutex::new(Some(replicator)));
++        let conn = open_bottomless_conn(Path::new(PATH), replicator.clone()).await;
++
++        let conn = exec(
++            conn,
++            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
++             INSERT INTO t(v) VALUES ('a');",
++        )
++        .await;
++
++        // fail exactly one snapshot PUT: the upload must recover on its own
++        injector.fail_snapshot_puts.store(1, Ordering::SeqCst);
++
++        let (conn, checkpointed) = try_checkpoint(conn).await;
++        assert!(checkpointed, "checkpoint of a fresh database must succeed");
++
++        let generation = {
++            let mut guard = replicator.lock().await;
++            let replicator = guard.as_mut().unwrap();
++            let generation = replicator.generation().unwrap();
++            let snapshotted = replicator.wait_until_snapshotted().await.unwrap();
++            assert!(
++                snapshotted,
++                "snapshot upload must succeed despite a failed attempt"
++            );
++            generation
++        };
++        assert_eq!(
++            injector.fail_snapshot_puts.load(Ordering::SeqCst),
++            0,
++            "the injected failure must have been consumed"
++        );
++
++        let client = assertion_client(PORT).await;
++        let snapshot_key = format!("{DB_ID}-{generation}/db.gz");
++        assert!(
++            object_exists(&client, BUCKET, &snapshot_key).await,
++            "snapshot object {snapshot_key} must exist after the retried upload"
++        );
++
++        // the per-generation compression artifact must have been cleaned up
++        for entry in std::fs::read_dir(PATH).unwrap() {
++            let name = entry.unwrap().file_name();
++            let name = name.to_str().unwrap().to_string();
++            assert!(
++                !name.starts_with("db."),
++                "leftover snapshot artifact: {name}"
++            );
++        }
++
++        close_conn(conn).await;
++    }
++
++    /// A snapshot upload that keeps failing must neither wedge checkpoints
++    /// until a process restart (the next checkpoint attempt re-triggers the
++    /// upload), nor be laundered into a success marker by a checkpoint
++    /// attempt that finds an empty WAL.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn failed_snapshot_recovers_without_restart() {
++        let _ = tracing_subscriber::fmt::try_init();
++
++        const DB_ID: &str = "testsnapshotwedge";
++        const BUCKET: &str = "testsnapshotwedge";
++        const PATH: &str = "snapshot_wedge.sqld";
++        const PORT: u16 = 9082;
++
++        let injector = S3FailureInjector::default();
++        start_flaky_s3_server(PORT, injector.clone()).await;
++        let options = flaky_s3_options(DB_ID, BUCKET, PORT);
++
++        let _cleaner = DbFileCleaner::new(PATH);
++        let replicator = init_replicator(Path::new(PATH), &options).await;
++        let replicator = Arc::new(tokio::sync::Mutex::new(Some(replicator)));
++        let conn = open_bottomless_conn(Path::new(PATH), replicator.clone()).await;
++
++        let conn = exec(
++            conn,
++            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
++             INSERT INTO t(v) VALUES ('a');",
++        )
++        .await;
++
++        // fail every snapshot PUT from now on
++        injector.fail_snapshot_puts.store(-1, Ordering::SeqCst);
++
++        // the checkpoint itself succeeds (the previous generation was
++        // snapshotted), but the snapshot of the new generation will fail
++        let (conn, checkpointed) = try_checkpoint(conn).await;
++        assert!(checkpointed, "checkpoint of a fresh database must succeed");
++
++        let wedged_generation = {
++            let mut guard = replicator.lock().await;
++            let replicator = guard.as_mut().unwrap();
++            let generation = replicator.generation().unwrap();
++            let err = replicator.wait_until_snapshotted().await;
++            assert!(err.is_err(), "snapshot upload must fail: {err:?}");
++            generation
++        };
++
++        // a checkpoint attempt with an empty WAL is refused and must not mark
++        // the failed snapshot as complete
++        let (conn, checkpointed) = try_checkpoint(conn).await;
++        assert!(
++            !checkpointed,
++            "empty-WAL checkpoint attempt must be refused"
++        );
++
++        let conn = exec(conn, "INSERT INTO t(v) VALUES ('b');").await;
++
++        // the failure must not have been laundered by the empty-WAL attempt:
++        // the next checkpoint has to be refused because the current generation
++        // still has no snapshot
++        let (conn, checkpointed) = try_checkpoint(conn).await;
++        assert!(
++            !checkpointed,
++            "checkpoint must be refused while the current generation has no snapshot"
++        );
++
++        // let snapshot uploads succeed again: checkpoint attempts re-trigger
++        // the missing snapshot and eventually proceed, without a restart
++        injector.fail_snapshot_puts.store(0, Ordering::SeqCst);
++
++        let mut conn = conn;
++        let mut recovered = false;
++        for _ in 0..40 {
++            sleep(Duration::from_millis(500)).await;
++            let (c, checkpointed) = try_checkpoint(conn).await;
++            conn = c;
++            if checkpointed {
++                recovered = true;
++                break;
++            }
++        }
++        assert!(
++            recovered,
++            "checkpoints must resume without a process restart once snapshot uploads succeed"
++        );
++
++        let client = assertion_client(PORT).await;
++        let snapshot_key = format!("{DB_ID}-{wedged_generation}/db.gz");
++        assert!(
++            object_exists(&client, BUCKET, &snapshot_key).await,
++            "the re-triggered snapshot upload must have stored {snapshot_key}"
++        );
++
++        close_conn(conn).await;
++    }
++
++    /// While a snapshot upload is in flight, another snapshot request is
++    /// skipped instead of spawning a second task that would race with the
++    /// first one.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn overlapping_snapshot_is_skipped() {
++        let _ = tracing_subscriber::fmt::try_init();
++
++        const DB_ID: &str = "testsnapshotoverlap";
++        const BUCKET: &str = "testsnapshotoverlap";
++        const PATH: &str = "snapshot_overlap.sqld";
++        const PORT: u16 = 9083;
++
++        let injector = S3FailureInjector::default();
++        start_flaky_s3_server(PORT, injector.clone()).await;
++        let options = flaky_s3_options(DB_ID, BUCKET, PORT);
++
++        let _cleaner = DbFileCleaner::new(PATH);
++        let replicator = init_replicator(Path::new(PATH), &options).await;
++        let replicator = Arc::new(tokio::sync::Mutex::new(Some(replicator)));
++        let conn = open_bottomless_conn(Path::new(PATH), replicator.clone()).await;
++
++        let conn = exec(
++            conn,
++            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
++             INSERT INTO t(v) VALUES ('a');",
++        )
++        .await;
++
++        // slow down the snapshot upload so that it is still in flight when the
++        // second snapshot request comes in
++        injector
++            .delay_snapshot_puts_ms
++            .store(2_000, Ordering::SeqCst);
++
++        let (conn, checkpointed) = try_checkpoint(conn).await;
++        assert!(checkpointed, "checkpoint of a fresh database must succeed");
++
++        {
++            let mut guard = replicator.lock().await;
++            let replicator = guard.as_mut().unwrap();
++            assert!(
++                replicator.snapshot_in_flight(),
++                "the delayed snapshot upload must still be in flight"
++            );
++            let handle = replicator.snapshot_main_db_file(true).await.unwrap();
++            assert!(
++                handle.is_none(),
++                "a snapshot request while an upload is in flight must be skipped"
++            );
++            let snapshotted = replicator.wait_until_snapshotted().await.unwrap();
++            assert!(snapshotted, "the in-flight snapshot upload must complete");
++        }
++
++        close_conn(conn).await;
++    }
++
++    /// Restarting a process on top of a non-empty database file creates a new
++    /// generation that carries a `.dep` link to the latest remote generation,
++    /// so the restore chain stays intact even if the new generation never
++    /// receives its snapshot.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn restart_links_new_generation_to_predecessor() {
++        let _ = tracing_subscriber::fmt::try_init();
++
++        const DB_ID: &str = "testsnapshotdep";
++        const BUCKET: &str = "testsnapshotdep";
++        const PATH: &str = "snapshot_dep.sqld";
++        const PORT: u16 = 9084;
++
++        let injector = S3FailureInjector::default();
++        start_flaky_s3_server(PORT, injector.clone()).await;
++        let options = flaky_s3_options(DB_ID, BUCKET, PORT);
++
++        let _cleaner = DbFileCleaner::new(PATH);
++        let replicator = init_replicator(Path::new(PATH), &options).await;
++        let replicator = Arc::new(tokio::sync::Mutex::new(Some(replicator)));
++        let conn = open_bottomless_conn(Path::new(PATH), replicator.clone()).await;
++
++        // two checkpointed write rounds pump the database change counter past
++        // 1, which is what makes a restart take the "local file is newer"
++        // shortcut that used to skip the `.dep` link
++        let mut conn = exec(
++            conn,
++            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
++             INSERT INTO t(v) VALUES ('a');",
++        )
++        .await;
++        for _ in 0..2 {
++            let (c, checkpointed) = try_checkpoint(conn).await;
++            conn = c;
++            assert!(checkpointed, "checkpoint must succeed");
++            let mut guard = replicator.lock().await;
++            let snapshotted = guard
++                .as_mut()
++                .unwrap()
++                .wait_until_snapshotted()
++                .await
++                .unwrap();
++            assert!(snapshotted, "snapshot upload must succeed");
++            drop(guard);
++            conn = exec(conn, "INSERT INTO t(v) VALUES ('b');").await;
++        }
++
++        close_conn(conn).await;
++        let pre_restart_generation = {
++            let mut replicator = replicator.lock().await.take().unwrap();
++            let generation = replicator.generation().unwrap();
++            replicator.shutdown_gracefully().await.unwrap();
++            generation
++        };
++
++        let header = std::fs::read(Path::new(PATH).join("data")).unwrap();
++        let change_counter = u32::from_be_bytes(header[24..28].try_into().unwrap());
++        assert!(
++            change_counter >= 2,
++            "test setup must leave a change counter >= 2, got {change_counter}"
++        );
++
++        // "restart": initialize a fresh replicator on top of the existing
++        // database file; it must create a new generation with a `.dep` link
++        // to the pre-restart generation
++        let mut restarted = init_replicator(Path::new(PATH), &options).await;
++        let post_restart_generation = restarted.generation().unwrap();
++        assert_ne!(post_restart_generation, pre_restart_generation);
++
++        let client = assertion_client(PORT).await;
++        let dep_key = format!("{DB_ID}-{post_restart_generation}/.dep");
++        let mut dep = None;
++        // the `.dep` object is stored asynchronously on a best-effort basis
++        for _ in 0..100 {
++            if let Ok(out) = client
++                .get_object()
++                .bucket(BUCKET)
++                .key(&dep_key)
++                .send()
++                .await
++            {
++                let bytes = out.body.collect().await.unwrap().into_bytes();
++                dep = Some(Uuid::from_bytes(bytes.as_ref().try_into().unwrap()));
++                break;
++            }
++            sleep(Duration::from_millis(100)).await;
++        }
++        assert_eq!(
++            dep,
++            Some(pre_restart_generation),
++            "the post-restart generation must carry a .dep link to its predecessor"
++        );
++
++        restarted.shutdown_gracefully().await.unwrap();
++    }
++}
