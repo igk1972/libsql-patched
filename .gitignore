@@ -1,0 +1,7 @@
+# Cloned upstream sources + built binaries
+/.build/
+
+.DS_Store
+
+# Local tooling
+/.claude/
