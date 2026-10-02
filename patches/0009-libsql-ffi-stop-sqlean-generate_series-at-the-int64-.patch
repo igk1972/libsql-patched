@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Kuznetsov <igk@igk.one>
+Date: Fri, 2 Oct 2026 18:59:20 +0500
+Subject: [PATCH] libsql-ffi: stop sqlean generate_series at the int64 range
+ instead of overflowing
+
+---
+ libsql-ffi/bundled/sqlean/stats/series.c | 24 ++++++++++++++++++------
+ 1 file changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/libsql-ffi/bundled/sqlean/stats/series.c b/libsql-ffi/bundled/sqlean/stats/series.c
+index 6fb8503a1c54b94f4d6d3fbb39751fd861d54a75..c92a21c844b95a94f1272a08140044c38ac775a4 100644
+--- a/libsql-ffi/bundled/sqlean/stats/series.c
++++ b/libsql-ffi/bundled/sqlean/stats/series.c
+@@ -7,6 +7,7 @@
+ // generate_series function.
+ 
+ #include <assert.h>
++#include <limits.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -27,6 +28,7 @@ struct series_cursor {
+     sqlite3_int64 mnValue;    /* Mimimum value ("start") */
+     sqlite3_int64 mxValue;    /* Maximum value ("stop") */
+     sqlite3_int64 iStep;      /* Increment ("step") */
++    int isEof;                /* The next value would overflow sqlite3_int64 */
+ };
+ 
+ /*
+@@ -107,10 +109,13 @@ static int seriesClose(sqlite3_vtab_cursor* cur) {
+ */
+ static int seriesNext(sqlite3_vtab_cursor* cur) {
+     series_cursor* pCur = (series_cursor*)cur;
+-    if (pCur->isDesc) {
+-        pCur->iValue -= pCur->iStep;
++    // A value beyond the sqlite3_int64 range is also beyond start/stop: the series ends.
++    sqlite3_int64 next;
++    if (pCur->isDesc ? __builtin_sub_overflow(pCur->iValue, pCur->iStep, &next)
++                     : __builtin_add_overflow(pCur->iValue, pCur->iStep, &next)) {
++        pCur->isEof = 1;
+     } else {
+-        pCur->iValue += pCur->iStep;
++        pCur->iValue = next;
+     }
+     pCur->iRowid++;
+     return SQLITE_OK;
+@@ -161,6 +166,9 @@ static int seriesRowid(sqlite3_vtab_cursor* cur, sqlite_int64* pRowid) {
+ */
+ static int seriesEof(sqlite3_vtab_cursor* cur) {
+     series_cursor* pCur = (series_cursor*)cur;
++    if (pCur->isEof) {
++        return 1;
++    }
+     if (pCur->isDesc) {
+         return pCur->iValue < pCur->mnValue;
+     } else {
+@@ -221,7 +229,7 @@ static int seriesFilter(sqlite3_vtab_cursor* pVtabCursor,
+         if (pCur->iStep == 0) {
+             pCur->iStep = 1;
+         } else if (pCur->iStep < 0) {
+-            pCur->iStep = -pCur->iStep;
++            pCur->iStep = pCur->iStep == LLONG_MIN ? LLONG_MAX : -pCur->iStep;
+             if ((idxNum & 16) == 0)
+                 idxNum |= 8;
+         }
+@@ -240,13 +248,17 @@ static int seriesFilter(sqlite3_vtab_cursor* pVtabCursor,
+     if (idxNum & 8) {
+         pCur->isDesc = 1;
+         pCur->iValue = pCur->mxValue;
+-        if (pCur->iStep > 0) {
+-            pCur->iValue -= (pCur->mxValue - pCur->mnValue) % pCur->iStep;
++        if (pCur->iStep > 0 && pCur->mxValue >= pCur->mnValue) {
++            // unsigned: stop - start may not fit into sqlite3_int64
++            pCur->iValue -= (sqlite3_int64)(((sqlite3_uint64)pCur->mxValue -
++                                             (sqlite3_uint64)pCur->mnValue) %
++                                            (sqlite3_uint64)pCur->iStep);
+         }
+     } else {
+         pCur->isDesc = 0;
+         pCur->iValue = pCur->mnValue;
+     }
++    pCur->isEof = 0;
+     pCur->iRowid = 1;
+     return SQLITE_OK;
+ }

@@ -1,0 +1,501 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Kuznetsov <igk@igk.one>
+Date: Fri, 2 Oct 2026 18:09:58 +0500
+Subject: [PATCH] libsql-ffi: update bundled sqlean text extension to 0.28.4
+
+---
+ libsql-ffi/bundled/sqlean/text/extension.c |  28 +++--
+ libsql-ffi/bundled/sqlean/text/rstring.c   |  40 ++-----
+ libsql-ffi/bundled/sqlean/text/runes.c     |  30 +++---
+ libsql-ffi/bundled/sqlean/text/runes.h     |   2 +-
+ libsql-ffi/bundled/sqlean/text/utf8/case.c | 118 ++++++++++++++-------
+ libsql-ffi/bundled/sqlean/text/utf8/utf8.c |  87 +++++++--------
+ libsql-ffi/bundled/sqlean/text/utf8/utf8.h |  35 +++---
+ 7 files changed, 178 insertions(+), 162 deletions(-)
+
+diff --git a/libsql-ffi/bundled/sqlean/text/extension.c b/libsql-ffi/bundled/sqlean/text/extension.c
+index c7dbd3d920fe631385f158b33a3c37b3b43455d0..c4b8f48b3853431c8d7845107a2aac69e7e21806 100644
+--- a/libsql-ffi/bundled/sqlean/text/extension.c
++++ b/libsql-ffi/bundled/sqlean/text/extension.c
+@@ -4,6 +4,7 @@
+ // SQLite extension for working with text.
+ 
+ #include <assert.h>
++#include <limits.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -688,18 +689,33 @@ static void text_change_case(sqlite3_context* context, int argc, sqlite3_value**
+     }
+     size_t n = sqlite3_value_bytes(argv[0]);
+ 
+-    char* res = malloc(n + 1);
++    // Case conversion can change the utf8 width of a character, so the result
++    // needs a buffer of its own. Converting expands by at most half.
++    size_t cap = n + n / 2 + 1;
++    char* res = malloc(cap);
+     if (res == NULL) {
+         sqlite3_result_error_nomem(context);
+         return;
+     }
+-    memcpy(res, src, n);
+-    res[n] = '\0';
+ 
+-    bool (*fn)(char*, size_t) = sqlite3_user_data(context);
+-    fn(res, n);
++    bool (*fn)(const char*, size_t, char*, size_t, size_t*) = sqlite3_user_data(context);
++    size_t len = 0;
++    if (!fn(src, n, res, cap, &len)) {
++        // src is not valid utf8 (or, in theory, the result did not fit in cap),
++        // so there is nothing sensible to convert. Return the input unchanged
++        // rather than a mangled result.
++        free(res);
++        sqlite3_result_value(context, argv[0]);
++        return;
++    }
+ 
+-    sqlite3_result_text(context, res, n, free);
++    if (len > INT_MAX) {
++        // sqlite3_result_text takes an int length.
++        free(res);
++        sqlite3_result_error_toobig(context);
++        return;
++    }
++    sqlite3_result_text(context, res, (int)len, free);
+ }
+ 
+ #pragma endregion
+diff --git a/libsql-ffi/bundled/sqlean/text/rstring.c b/libsql-ffi/bundled/sqlean/text/rstring.c
+index b3384bec7ab73bac334fae0ad9a4d3eb7f15f0b5..d12023ce9b25c14b27211c19ec860830cd704db3 100644
+--- a/libsql-ffi/bundled/sqlean/text/rstring.c
++++ b/libsql-ffi/bundled/sqlean/text/rstring.c
+@@ -14,33 +14,6 @@
+ #include "text/runes.h"
+ #include "text/utf8/rune.h"
+ 
+-// utf8_length returns the number of utf-8 characters in a string.
+-static size_t utf8_length(const char* str) {
+-    size_t length = 0;
+-
+-    while (*str != '\0') {
+-        if (0xf0 == (0xf8 & *str)) {
+-            // 4-byte utf8 code point (began with 0b11110xxx)
+-            str += 4;
+-        } else if (0xe0 == (0xf0 & *str)) {
+-            // 3-byte utf8 code point (began with 0b1110xxxx)
+-            str += 3;
+-        } else if (0xc0 == (0xe0 & *str)) {
+-            // 2-byte utf8 code point (began with 0b110xxxxx)
+-            str += 2;
+-        } else {  // if (0x00 == (0x80 & *s)) {
+-            // 1-byte ascii (began with 0b0xxxxxxx)
+-            str += 1;
+-        }
+-
+-        // no matter the bytes we marched s forward by, it was
+-        // only 1 utf8 codepoint
+-        length++;
+-    }
+-
+-    return length;
+-}
+-
+ // rstring_new creates an empty string.
+ RuneString rstring_new(void) {
+     RuneString str = {.runes = NULL, .length = 0, .size = 0, .owning = true};
+@@ -57,9 +30,16 @@ static RuneString rstring_from_runes(const int32_t* const runes, size_t length,
+ 
+ // rstring_from_cstring creates a new string from a zero-terminated C string.
+ RuneString rstring_from_cstring(const char* const utf8str) {
+-    size_t length = utf8_length(utf8str);
+-    int32_t* runes = length > 0 ? runes_from_cstring(utf8str, length) : NULL;
+-    return rstring_from_runes(runes, length, true);
++    size_t n = strlen(utf8str);
++    if (n == 0) {
++        return rstring_new();
++    }
++    size_t count = 0;
++    int32_t* runes = runes_from_cstring(utf8str, n, &count);
++    if (runes == NULL) {
++        return rstring_new();
++    }
++    return rstring_from_runes(runes, count, true);
+ }
+ 
+ // rstring_to_cstring converts the string to a zero-terminated C string.
+diff --git a/libsql-ffi/bundled/sqlean/text/runes.c b/libsql-ffi/bundled/sqlean/text/runes.c
+index 7628d5a871a45bbfa75aac2aef385ec9097ba688..dcf2fb90394ab1daac2ebd5893353da71930ed00 100644
+--- a/libsql-ffi/bundled/sqlean/text/runes.c
++++ b/libsql-ffi/bundled/sqlean/text/runes.c
+@@ -11,25 +11,29 @@
+ #include "text/runes.h"
+ #include "text/utf8/utf8.h"
+ 
+-// runes_from_cstring creates an array of runes from a C string.
+-int32_t* runes_from_cstring(const char* const str, size_t length) {
+-    assert(length > 0);
+-    int32_t* runes = calloc(length, sizeof(int32_t));
++// runes_from_cstring decodes n bytes into runes and stores their count.
++int32_t* runes_from_cstring(const char* const str, size_t n, size_t* count) {
++    assert(n > 0);
++    // one rune per byte is the worst case (ascii, or U+FFFD substitutions)
++    int32_t* runes = malloc(n * sizeof(int32_t));
+     if (runes == NULL) {
++        *count = 0;
+         return NULL;
+     }
+ 
+-    utf8_decode_t d = {.state = 0};
+-    const char* s = str;
+-    size_t idx = 0;
+-    while (idx < length && *s != 0) {
+-        do {
+-            utf8_decode(&d, (uint8_t)*s++);
+-        } while (d.state);
+-        runes[idx] = d.codep;
+-        idx += 1;
++    size_t i = 0, idx = 0;
++    while (i < n) {
++        runes[idx++] = (int32_t)utf8_next(str, n, &i);
+     }
++    *count = idx;
+ 
++    if (idx < n) {
++        // shrink to real size
++        int32_t* shrunk = realloc(runes, idx * sizeof(int32_t));
++        if (shrunk != NULL) {
++            runes = shrunk;
++        }
++    }
+     return runes;
+ }
+ 
+diff --git a/libsql-ffi/bundled/sqlean/text/runes.h b/libsql-ffi/bundled/sqlean/text/runes.h
+index 643a181032710635255b02da49b5867b65a0c883..f4c75b5df946745567c2c103a1340ce3f869b6b4 100644
+--- a/libsql-ffi/bundled/sqlean/text/runes.h
++++ b/libsql-ffi/bundled/sqlean/text/runes.h
+@@ -9,7 +9,7 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ 
+-int32_t* runes_from_cstring(const char* const str, size_t length);
++int32_t* runes_from_cstring(const char* const str, size_t n, size_t* count);
+ char* runes_to_cstring(const int32_t* runes, size_t length);
+ 
+ #endif /* RUNES_H */
+diff --git a/libsql-ffi/bundled/sqlean/text/utf8/case.c b/libsql-ffi/bundled/sqlean/text/utf8/case.c
+index 2e4fcff97f3886d3eee2aa00a2bb6b1dc8b4d55e..69f1fe4aaa4c5a8735162b841cb6790a5dbbdb18 100644
+--- a/libsql-ffi/bundled/sqlean/text/utf8/case.c
++++ b/libsql-ffi/bundled/sqlean/text/utf8/case.c
+@@ -10,58 +10,100 @@
+ #include "text/utf8/rune.h"
+ #include "text/utf8/utf8.h"
+ 
+-// utf8_transform converts the utf8 string s using the transform function.
+-static bool utf8_transform(char* s, size_t n, uint32_t (*transform)(uint32_t)) {
++// utf8_put encodes the codepoint c at offset *out in dst, which has dstcap bytes,
++// advancing *out by the number of bytes written. Always leaves room for a
++// terminating zero. Returns false if c is not encodable or does not fit.
++static bool utf8_put(char* dst, size_t dstcap, size_t* out, uint32_t c) {
++    char buf[4];
++    int len = utf8_encode(buf, c);
++    if (len == 0 || *out + (size_t)len + 1 > dstcap) {
++        return false;
++    }
++    memcpy(dst + *out, buf, (size_t)len);
++    *out += (size_t)len;
++    return true;
++}
++
++// utf8_transform converts the utf8 string src of n bytes using the transform
++// function, writing the result to dst and its byte length to dstlen.
++// ctx carries state between characters for transforms that need it.
++//
++// Returns false if src is not valid utf8 or the result does not fit in dst.
++static bool utf8_transform(const char* src,
++                           size_t n,
++                           char* dst,
++                           size_t dstcap,
++                           size_t* dstlen,
++                           uint32_t (*transform)(uint32_t, void*),
++                           void* ctx) {
++    if (dstcap == 0) {
++        return false;
++    }
+     utf8_decode_t d = {.state = 0};
+-    while ((n > 0) & (*s != 0)) {
+-        size_t i = 0;
++    size_t in = 0, out = 0;
++    // Iterate over all n bytes: sqlite text may contain embedded zeros, and
++    // U+0000 is a perfectly good codepoint to convert (to itself).
++    while (in < n) {
++        // Decode one character, advancing the input by the bytes it consumes
++        // and never reading past the end of src.
+         do {
+-            utf8_decode(&d, (uint8_t)s[i++]);
+-        } while (d.state);
+-        uint32_t c = transform(d.codep);
+-        int len = utf8_encode(s, c);
+-        if (len == 0) {
++            utf8_decode(&d, (uint8_t)src[in++]);
++        } while (d.state && (in < n));
++        if (d.state != 0) {
++            // Invalid or truncated utf8 sequence.
++            return false;
++        }
++        if (!utf8_put(dst, dstcap, &out, transform(d.codep, ctx))) {
+             return false;
+         }
+-        s += len;
+-        n -= len;
+     }
++    dst[out] = '\0';
++    *dstlen = out;
+     return true;
+ }
+ 
+-// utf8_tolower converts the utf8 string s to lowercase.
++static uint32_t transform_tolower(uint32_t c, void* ctx) {
++    (void)ctx;
++    return rune_tolower(c);
++}
++
++static uint32_t transform_toupper(uint32_t c, void* ctx) {
++    (void)ctx;
++    return rune_toupper(c);
++}
++
++static uint32_t transform_casefold(uint32_t c, void* ctx) {
++    (void)ctx;
++    return rune_casefold(c);
++}
++
++// transform_totitle uppercases the first character of each word and
++// lowercases the rest. ctx points to the "at start of a word" flag.
++static uint32_t transform_totitle(uint32_t c, void* ctx) {
++    bool* upper = ctx;
++    uint32_t res = *upper ? rune_toupper(c) : rune_tolower(c);
++    *upper = !rune_isword(c);
++    return res;
++}
++
++// utf8_tolower converts the utf8 string src to lowercase, writing the result to dst.
+ // Returns true if successful, false if an error occurred.
+-bool utf8_tolower(char* s, size_t n) {
+-    return utf8_transform(s, n, rune_tolower);
++bool utf8_tolower(const char* src, size_t n, char* dst, size_t dstcap, size_t* dstlen) {
++    return utf8_transform(src, n, dst, dstcap, dstlen, transform_tolower, NULL);
+ }
+ 
+-// utf8_toupper converts the utf8 string s to uppercase.
+-bool utf8_toupper(char* s, size_t n) {
+-    return utf8_transform(s, n, rune_toupper);
++// utf8_toupper converts the utf8 string src to uppercase, writing the result to dst.
++bool utf8_toupper(const char* src, size_t n, char* dst, size_t dstcap, size_t* dstlen) {
++    return utf8_transform(src, n, dst, dstcap, dstlen, transform_toupper, NULL);
+ }
+ 
+-// utf8_casefold converts the utf8 string s to folded-case.
+-bool utf8_casefold(char* s, size_t n) {
+-    return utf8_transform(s, n, rune_casefold);
++// utf8_casefold converts the utf8 string src to folded-case, writing the result to dst.
++bool utf8_casefold(const char* src, size_t n, char* dst, size_t dstcap, size_t* dstlen) {
++    return utf8_transform(src, n, dst, dstcap, dstlen, transform_casefold, NULL);
+ }
+ 
+-// utf8_totitle converts the utf8 string s to title-case.
+-bool utf8_totitle(char* s, size_t n) {
+-    utf8_decode_t d = {.state = 0};
++// utf8_totitle converts the utf8 string src to title-case, writing the result to dst.
++bool utf8_totitle(const char* src, size_t n, char* dst, size_t dstcap, size_t* dstlen) {
+     bool upper = true;
+-    while ((n > 0) & (*s != 0)) {
+-        size_t i = 0;
+-        do {
+-            utf8_decode(&d, (uint8_t)s[i++]);
+-        } while (d.state);
+-        uint32_t c = upper ? rune_toupper(d.codep) : rune_tolower(d.codep);
+-        int len = utf8_encode(s, c);
+-        if (len == 0) {
+-            return false;
+-        }
+-        upper = !rune_isword(d.codep);
+-        s += len;
+-        n -= len;
+-    }
+-    return true;
++    return utf8_transform(src, n, dst, dstcap, dstlen, transform_totitle, &upper);
+ }
+diff --git a/libsql-ffi/bundled/sqlean/text/utf8/utf8.c b/libsql-ffi/bundled/sqlean/text/utf8/utf8.c
+index 1e26f51fffd8e48dd7dc6eb1394374c4f111f168..b0fa3b624d8a1f7441d4c8a1cf80204ec8861904 100644
+--- a/libsql-ffi/bundled/sqlean/text/utf8/utf8.c
++++ b/libsql-ffi/bundled/sqlean/text/utf8/utf8.c
+@@ -23,10 +23,7 @@
+ 
+ // UTF-8 string handling.
+ 
+-#include <ctype.h>
+-#include <stdbool.h>
+ #include <stdint.h>
+-#include <string.h>
+ 
+ #include "text/utf8/rune.h"
+ #include "text/utf8/utf8.h"
+@@ -88,65 +85,53 @@ int utf8_encode(char* out, uint32_t c) {
+ 
+ // String functions.
+ 
+-// utf8_at returns a pointer to the utf8 codepoint at index in s.
+-const char* utf8_at(const char* s, size_t n, size_t index) {
+-    while ((index > 0) & (*s != 0) & (n-- != 0)) {
+-        index -= (*++s & 0xC0) != 0x80;
+-    }
+-    return s;
+-}
+-
+-// utf8_pos returns the byte position of the utf8 codepoint at index in s.
+-size_t utf8_pos(const char* s, size_t n, size_t index) {
+-    return (size_t)(utf8_at(s, n, index) - s);
+-}
++// UTF8_REJECT is the decoder state after a byte that cannot appear in a valid
++// utf8 sequence at that position. The reject state is sticky: feeding the
++// decoder more bytes never gets it out, so a loop waiting for the accept
++// state must treat it as final.
++#define UTF8_REJECT 12
+ 
+-// utf8_len returns the number of utf8 codepoints in s.
+-size_t utf8_len(const char* s, size_t n) {
+-    size_t size = 0;
+-    while ((n-- != 0) & (*s != 0)) {
+-        size += (*++s & 0xC0) != 0x80;
++// utf8_next decodes the codepoint starting at byte *i of s, which has n bytes,
++// and advances *i past it. It never reads past the n bytes, and *i always
++// advances, so a loop over utf8_next visits every byte exactly once.
++// An invalid or truncated sequence decodes as U+FFFD, the replacement
++// character, one per maximal ill-formed subpart: the bytes that form a valid
++// prefix collapse into a single U+FFFD, and the byte that broke the sequence
++// is left for the next call, since it may well start a valid one.
++uint32_t utf8_next(const char* s, size_t n, size_t* i) {
++    if (*i >= n) {
++        return 0;
+     }
+-    return size;
+-}
+-
+-// utf8_peek returns the utf8 codepoint at the start of s.
+-uint32_t utf8_peek(const char* s) {
++    const size_t start = *i;
+     utf8_decode_t d = {.state = 0};
++    uint32_t state;
+     do {
+-        utf8_decode(&d, (uint8_t)*s++);
+-    } while (d.state);
+-    return d.codep;
+-}
+-
+-// utf8_peek_at returns the utf8 codepoint at the index pos from s.
+-uint32_t utf8_peek_at(const char* s, size_t n, size_t pos) {
+-    return utf8_peek(utf8_at(s, n, pos));
++        state = utf8_decode(&d, (uint8_t)s[(*i)++]);
++    } while (state != 0 && state != UTF8_REJECT && *i < n);
++    if (state == 0) {
++        return d.codep;
++    }
++    if (state == UTF8_REJECT && *i - start > 1) {
++        // the last byte broke a sequence it was never part of:
++        // give it back so the next call can try it as a sequence start
++        (*i)--;
++    }
++    return 0xFFFD;
+ }
+ 
+ // utf8_icmp compares the utf8 strings s1 and s2 case-insensitively.
+ int utf8_icmp(const char* s1, size_t n1, const char* s2, size_t n2) {
+-    utf8_decode_t d1 = {.state = 0}, d2 = {.state = 0};
+     size_t j1 = 0, j2 = 0;
+     while ((j1 < n1) & (j2 < n2)) {
+-        do {
+-            utf8_decode(&d1, (uint8_t)s1[j1++]);
+-        } while (d1.state);
+-        do {
+-            utf8_decode(&d2, (uint8_t)s2[j2++]);
+-        } while (d2.state);
+-        int32_t c = (int32_t)rune_casefold(d1.codep) - (int32_t)rune_casefold(d2.codep);
++        uint32_t c1 = utf8_next(s1, n1, &j1);
++        uint32_t c2 = utf8_next(s2, n2, &j2);
++        int32_t c = (int32_t)rune_casefold(c1) - (int32_t)rune_casefold(c2);
+         if (c || !s2[j2 - 1])  // OK if n1 and n2 are npos
+             return (int)c;
+     }
+-    return (int)(n1 - n2);
+-}
+-
+-// utf8_valid returns true if s is a valid utf8 string.
+-bool utf8_valid(const char* s, size_t n) {
+-    utf8_decode_t d = {.state = 0};
+-    while ((n-- != 0) & (*s != 0)) {
+-        utf8_decode(&d, (uint8_t)*s++);
+-    }
+-    return d.state == 0;
++    // the string whose codepoints ran out first is the smaller one.
++    // byte lengths cannot decide this: a casefold may change the encoded
++    // width (ſ is two bytes but folds to the one-byte s), so equal decoded
++    // streams can have unequal byte lengths
++    return (j1 < n1) - (j2 < n2);
+ }
+diff --git a/libsql-ffi/bundled/sqlean/text/utf8/utf8.h b/libsql-ffi/bundled/sqlean/text/utf8/utf8.h
+index fc2f9d078eaadff3fa88e00e4f28f31367eac3fa..9f297b5d097b095f35d0b947e955ff42804b9734 100644
+--- a/libsql-ffi/bundled/sqlean/text/utf8/utf8.h
++++ b/libsql-ffi/bundled/sqlean/text/utf8/utf8.h
+@@ -6,6 +6,8 @@
+ #ifndef UTF8_H
+ #define UTF8_H
+ 
++#include <stdbool.h>
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ // decode next utf8 codepoint.
+@@ -20,32 +22,19 @@ uint32_t utf8_decode(utf8_decode_t* d, const uint32_t byte);
+ // and returns the number of bytes written.
+ int utf8_encode(char* out, uint32_t c);
+ 
+-// utf8_len returns the number of utf8 codepoints in s.
+-size_t utf8_len(const char* s, size_t n);
+-
+-// utf8_at returns a pointer to the utf8 codepoint at index in s.
+-const char* utf8_at(const char* s, size_t n, size_t index);
+-// utf8_pos returns the byte position of the utf8 codepoint at index in s.
+-size_t utf8_pos(const char* s, size_t n, size_t index);
+-
+-// utf8_peek returns the utf8 codepoint at the start of s.
+-uint32_t utf8_peek(const char* s);
+-// utf8_peek_at returns the utf8 codepoint at the index pos from s.
+-uint32_t utf8_peek_at(const char* s, size_t n, size_t pos);
++// utf8_next decodes the next codepoint and advances the byte index.
++uint32_t utf8_next(const char* s, size_t n, size_t* i);
+ 
+ // utf8_icmp compares the utf8 strings s1 and s2 case-insensitively.
+ int utf8_icmp(const char* s1, size_t n1, const char* s2, size_t n2);
+ 
+-// utf8_valid returns true if s is a valid utf8 string.
+-bool utf8_valid(const char* s, size_t n);
+-
+-// utf8_tolower converts the utf8 string s to lowercase.
+-bool utf8_tolower(char* s, size_t n);
+-// utf8_toupper converts the utf8 string s to uppercase.
+-bool utf8_toupper(char* s, size_t n);
+-// utf8_totitle converts the utf8 string s to title-case.
+-bool utf8_totitle(char* s, size_t n);
+-// utf8_casefold converts the utf8 string s to folded-case.
+-bool utf8_casefold(char* s, size_t n);
++// utf8_tolower converts the utf8 string src to lowercase.
++bool utf8_tolower(const char* src, size_t n, char* dst, size_t dstcap, size_t* dstlen);
++// utf8_toupper converts the utf8 string src to uppercase.
++bool utf8_toupper(const char* src, size_t n, char* dst, size_t dstcap, size_t* dstlen);
++// utf8_totitle converts the utf8 string src to title-case.
++bool utf8_totitle(const char* src, size_t n, char* dst, size_t dstcap, size_t* dstlen);
++// utf8_casefold converts the utf8 string src to folded-case.
++bool utf8_casefold(const char* src, size_t n, char* dst, size_t dstcap, size_t* dstlen);
+ 
+ #endif  // UTF8_H

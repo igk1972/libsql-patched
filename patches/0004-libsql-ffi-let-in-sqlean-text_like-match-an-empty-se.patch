@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Kuznetsov <igk@igk.one>
+Date: Fri, 2 Oct 2026 18:11:05 +0500
+Subject: [PATCH] libsql-ffi: let % in sqlean text_like match an empty sequence
+
+---
+ libsql-ffi/bundled/sqlean/text/rstring.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/libsql-ffi/bundled/sqlean/text/rstring.c b/libsql-ffi/bundled/sqlean/text/rstring.c
+index d12023ce9b25c14b27211c19ec860830cd704db3..dfe1f9b26a7607c809ad937b248c3fb5a395ac9f 100644
+--- a/libsql-ffi/bundled/sqlean/text/rstring.c
++++ b/libsql-ffi/bundled/sqlean/text/rstring.c
+@@ -213,8 +213,10 @@ bool rstring_like(RuneString pattern, RuneString str) {
+         int32_t srune = str.runes[sidx];
+ 
+         if (prune == '%') {
++            // '%' matches any sequence, the empty one included: try the rest of
++            // the pattern here first, then from each following position
+             star_idx = ++pidx;
+-            match = ++sidx;
++            match = sidx;
+             if (pidx == pattern.length) {
+                 return true;
+             }
+@@ -223,7 +225,7 @@ bool rstring_like(RuneString pattern, RuneString str) {
+             sidx++;
+         } else if (star_idx != SIZE_MAX) {
+             pidx = star_idx;
+-            sidx = match++;
++            sidx = ++match;
+         } else {
+             return false;
+         }

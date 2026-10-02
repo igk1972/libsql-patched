@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Kuznetsov <igk@igk.one>
+Date: Fri, 2 Oct 2026 18:59:20 +0500
+Subject: [PATCH] libsql-ffi: avoid int overflow in sqlean translit UTF-8
+ decoding
+
+---
+ libsql-ffi/bundled/sqlean/fuzzy/translit.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/libsql-ffi/bundled/sqlean/fuzzy/translit.c b/libsql-ffi/bundled/sqlean/fuzzy/translit.c
+index cc9290e78430060964da7174c8d01269e181a512..2b376dbc2c163c03e5a4ae28dd05e496e188be6e 100644
+--- a/libsql-ffi/bundled/sqlean/fuzzy/translit.c
++++ b/libsql-ffi/bundled/sqlean/fuzzy/translit.c
+@@ -37,7 +37,8 @@ static int utf8Read(const unsigned char* z, int n, int* pSize) {
+         if (c >= 0xc0) {
+             c = translit_utf8_lookup[c - 0xc0];
+             while (i < n && (z[i] & 0xc0) == 0x80) {
+-                c = (c << 6) + (0x3f & z[i++]);
++                // unsigned: a long run of continuation bytes would overflow int
++                c = (int)(((unsigned int)c << 6) + (0x3f & z[i++]));
+             }
+         }
+     }

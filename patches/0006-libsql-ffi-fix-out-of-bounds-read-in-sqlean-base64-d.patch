@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Kuznetsov <igk@igk.one>
+Date: Fri, 2 Oct 2026 18:53:49 +0500
+Subject: [PATCH] libsql-ffi: fix out-of-bounds read in sqlean base64 decoding
+
+---
+ libsql-ffi/bundled/sqlean/crypto/base64.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/libsql-ffi/bundled/sqlean/crypto/base64.c b/libsql-ffi/bundled/sqlean/crypto/base64.c
+index dccc599136a75c5ffa49a0ba5375d3fc76c4ed07..a4c8d3e7a7b3c94df7eae7fafbc529f55d0b2197 100644
+--- a/libsql-ffi/bundled/sqlean/crypto/base64.c
++++ b/libsql-ffi/bundled/sqlean/crypto/base64.c
+@@ -42,7 +42,8 @@ uint8_t* base64_encode(const uint8_t* src, size_t len, size_t* out_len) {
+     return encoded;
+ }
+ 
+-static const uint8_t base64_table[] = {
++// Sized for every byte value: non-base64 bytes map to 0 and are rejected by the decoder.
++static const uint8_t base64_table[256] = {
+     // Map base64 characters to their corresponding values
+     ['A'] = 0,  ['B'] = 1,  ['C'] = 2,  ['D'] = 3,  ['E'] = 4,  ['F'] = 5,  ['G'] = 6,  ['H'] = 7,
+     ['I'] = 8,  ['J'] = 9,  ['K'] = 10, ['L'] = 11, ['M'] = 12, ['N'] = 13, ['O'] = 14, ['P'] = 15,

@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Kuznetsov <igk@igk.one>
+Date: Fri, 2 Oct 2026 18:53:58 +0500
+Subject: [PATCH] libsql-ffi: avoid int overflow in sqlean text_substring and
+ right
+
+---
+ libsql-ffi/bundled/sqlean/text/extension.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/libsql-ffi/bundled/sqlean/text/extension.c b/libsql-ffi/bundled/sqlean/text/extension.c
+index c4b8f48b3853431c8d7845107a2aac69e7e21806..78361da186e9e89a3115f6dcab86ac8cc20ee557 100644
+--- a/libsql-ffi/bundled/sqlean/text/extension.c
++++ b/libsql-ffi/bundled/sqlean/text/extension.c
+@@ -65,13 +65,14 @@ static void text_substring3(sqlite3_context* context, int argc, sqlite3_value**
+         sqlite3_result_error(context, "start parameter should be integer", -1);
+         return;
+     }
+-    int start = sqlite3_value_int(argv[1]);
++    // 64-bit, so that start - 1 cannot overflow for start = INT_MIN
++    sqlite3_int64 start = sqlite3_value_int(argv[1]);
+ 
+     if (sqlite3_value_type(argv[2]) != SQLITE_INTEGER) {
+         sqlite3_result_error(context, "length parameter should be integer", -1);
+         return;
+     }
+-    int length = sqlite3_value_int(argv[2]);
++    sqlite3_int64 length = sqlite3_value_int(argv[2]);
+     if (length < 0) {
+         sqlite3_result_error(context, "length parameter should >= 0", -1);
+         return;
+@@ -225,12 +226,14 @@ static void text_right(sqlite3_context* context, int argc, sqlite3_value** argv)
+         sqlite3_result_error(context, "length parameter should be integer", -1);
+         return;
+     }
+-    int length = sqlite3_value_int(argv[1]);
++    // 64-bit, so that the arithmetic below cannot overflow for length = INT_MIN
++    sqlite3_int64 length = sqlite3_value_int(argv[1]);
+ 
+     RuneString s_src = rstring_from_cstring(src);
+ 
+-    length = (length < 0) ? (int)s_src.length + length : length;
+-    int start = (int)s_src.length - length;
++    length = (length < 0) ? (sqlite3_int64)s_src.length + length : length;
++    length = length < 0 ? 0 : length;
++    sqlite3_int64 start = (sqlite3_int64)s_src.length - length;
+     start = start < 0 ? 0 : start;
+ 
+     RuneString s_res = rstring_substring(s_src, start, length);

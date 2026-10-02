@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Kuznetsov <igk@igk.one>
+Date: Fri, 2 Oct 2026 18:59:20 +0500
+Subject: [PATCH] libsql-ffi: return early from sqlean text_repeat for an empty
+ string
+
+---
+ libsql-ffi/bundled/sqlean/text/bstring.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/libsql-ffi/bundled/sqlean/text/bstring.c b/libsql-ffi/bundled/sqlean/text/bstring.c
+index 1bada067bc9eeea1d93ec31f5f7d341d1ebd76e8..6e6bb69f7865785d71fa1ca47c3be206760be7e7 100644
+--- a/libsql-ffi/bundled/sqlean/text/bstring.c
++++ b/libsql-ffi/bundled/sqlean/text/bstring.c
+@@ -339,6 +339,11 @@ ByteString bstring_concat(ByteString* strings, size_t count) {
+ // bstring_repeat concatenates the string to itself a given number of times
+ // and returns the resulting string.
+ ByteString bstring_repeat(ByteString str, size_t count) {
++    // an empty string repeats into an empty one, without looping up to INT_MAX times
++    if (str.length == 0) {
++        count = 0;
++    }
++
+     // calculate total string length
+     size_t total_length = str.length * count;
+ 
