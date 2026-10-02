@@ -1,0 +1,18 @@
+# mise configuration for building a patched libsql-server (sqld).
+# Only the patches live in this repository; setup:sources clones upstream and applies them.
+
+[tools]
+# Must equal the channel in upstream's rust-toolchain.toml at LIBSQL_REF;
+# build:sqld refuses to build with any other rustc.
+rust = "1.85.0"
+
+[env]
+# --- Upstream source pin (cloned + patched by setup:sources) ---
+LIBSQL_REPO = "https://github.com/tursodatabase/libsql.git"
+# main @ 2026-03-25: libsql-server 0.24.33 + 20 commits, published upstream as
+# ghcr.io/tursodatabase/libsql-server:e4beaca.
+LIBSQL_REF = "e4beacaa266fba930b637515e2082b42c2d6a817"
+
+# --- Paths ---
+SRC_DIR = "{{config_root}}/.build/libsql"
+BIN_DIR = "{{config_root}}/.build/bin"
