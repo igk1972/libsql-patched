@@ -209,6 +209,28 @@ Regressions whose effect shows in SQL (wrong result, statement that never ends) 
 `tests/sqlean/fuzz-regressions.sql`, run by `test:sqlean`; memory errors are covered by the
 fuzzer.
 
+### 0011 — libsql-server: drain prometheus histogram samples on a timer instead of only on scrape
+
+With the admin API enabled, sqld installs a `metrics-exporter-prometheus` 0.12 recorder. That
+recorder keeps every histogram sample (`(f64, Instant)`, 16 bytes) in memory until the metrics
+are rendered, which only `GET /metrics` on the admin API does; version 0.12 has no upkeep task.
+Every hrana statement records six histograms (`libsql_server_statement_execution_time`,
+`…_statement_mem_used_bytes`, `…_returned_bytes`, `…_connection_create_time`,
+`…_connection_alive_duration`, `…_total_response_size_before_lock`), so a server nobody scrapes
+grows by about 130 bytes per statement for as long as it runs — some 7 MB/h at 15 statements/s.
+
+- `libsql-server/src/http/admin/mod.rs`
+  - a task renders the metrics every 60 s and discards the output, which moves the samples
+    into the recorder's bounded summaries; `/metrics` still reports everything;
+  - the recorder's 120 s idle timeout is removed. It deleted idle metrics from the registry
+    whenever the metrics were rendered, but the handles cached in `libsql-server/src/metrics.rs`
+    statics kept writing into the detached histograms, which nothing drains any more — the same
+    growth again for every metric that pauses for two minutes (write transactions, checkpoints).
+    Metric keys are bounded by metric names and namespaces, so nothing needs pruning.
+
+Without the patch, `LIBSQL_DISABLE_METRICS=true` (`--disable-metrics`) stops the growth too, at
+the price of an empty `/metrics`.
+
 ## Fuzzing sqlean
 
 `mise run fuzz:sqlean [seconds] [--seed N]` builds `tests/sqlean/fuzz.c` together with SQLite
