@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: libsql-patched <libsql-patched@localhost>
+Date: Sun, 11 Oct 2026 17:38:59 +0500
+Subject: [PATCH] libsql-server: drain prometheus histogram samples on a timer
+ instead of only on scrape
+
+---
+ libsql-server/src/http/admin/mod.rs | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/libsql-server/src/http/admin/mod.rs b/libsql-server/src/http/admin/mod.rs
+index 69536963125c40e540526cbcb6b8791705a01fc8..2a3a4faaae5cd009bce188bb07d14e372dd35e81 100644
+--- a/libsql-server/src/http/admin/mod.rs
++++ b/libsql-server/src/http/admin/mod.rs
+@@ -32,6 +32,8 @@ use crate::LIBSQL_PAGE_SIZE;
+ 
+ pub mod stats;
+ 
++const METRICS_UPKEEP_INTERVAL: Duration = Duration::from_secs(60);
++
+ #[derive(Clone)]
+ struct Metrics {
+     handle: Option<PrometheusHandle>,
+@@ -80,10 +82,7 @@ where
+         let lock = PROM_HANDLE.lock();
+         let prom_handle = lock.get_or_init(|| {
+             tracing::info!("initializing prometheus metrics");
+-            let b = PrometheusBuilder::new().idle_timeout(
+-                metrics_util::MetricKindMask::ALL,
+-                Some(Duration::from_secs(120)),
+-            );
++            let b = PrometheusBuilder::new();
+ 
+             if let Some(app_label) = app_label {
+                 b.add_global_label("app", app_label)
+@@ -95,6 +94,18 @@ where
+             }
+         });
+ 
++        // The recorder keeps every histogram sample until it renders, so a server nobody scrapes
++        // grows without bound: render on a timer and discard the output.
++        let upkeep_handle = prom_handle.clone();
++        tokio::task::spawn(async move {
++            let mut interval = tokio::time::interval(METRICS_UPKEEP_INTERVAL);
++            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
++            loop {
++                interval.tick().await;
++                let _ = upkeep_handle.render();
++            }
++        });
++
+         tokio::task::spawn(async move {
+             loop {
+                 let runtime = tokio::runtime::Handle::current();
