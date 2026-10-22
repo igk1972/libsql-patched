@@ -293,6 +293,19 @@ Reading a profile needs the binary that wrote it, `jeprof` (built with jemalloc,
 `jeprof --text /bin/sqld <profile>`, and for growth between two profiles
 `jeprof --text --base=<earlier> /bin/sqld <later>`.
 
+### 0013 — bottomless: join finished S3 upload tasks instead of keeping them until shutdown
+
+Every replicator runs a task that takes WAL batches off a queue and uploads each one to S3 in a
+task of its own, spawned into a `JoinSet`. A `JoinSet` keeps a finished task until it is joined,
+and this one was joined only at shutdown, so every uploaded batch left its task allocation behind
+for as long as the replicator lived — as long as the process, for a database that is never
+detached. Growth follows write traffic and stops when writes stop: on a production server with
+light load it was about 1.8 MiB/h in the daytime, and a heap profile put almost all of it in
+`Replicator::with_options`'s upload task.
+
+- `bottomless/src/replicator.rs` — before spawning the next upload, the task joins the uploads
+  that have finished (`JoinSet::try_join_next`) and ignores their results, as the join at shutdown does.
+
 ## Fuzzing sqlean
 
 `mise run fuzz:sqlean [seconds] [--seed N]` builds `tests/sqlean/fuzz.c` together with SQLite
