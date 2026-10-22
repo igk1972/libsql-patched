@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: libsql-patched <libsql-patched@localhost>
+Date: Thu, 22 Oct 2026 10:01:24 +0500
+Subject: [PATCH] bottomless: join finished S3 upload tasks instead of keeping
+ them until shutdown
+
+---
+ bottomless/src/replicator.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/bottomless/src/replicator.rs b/bottomless/src/replicator.rs
+index 9d249b340291dc040d74bd0f2438343a8b0eb9f1..5386eb1a8d6bab119bcc17efea1258ca5d869ccf 100644
+--- a/bottomless/src/replicator.rs
++++ b/bottomless/src/replicator.rs
+@@ -542,6 +542,9 @@ impl Replicator {
+                 let sem = Arc::new(tokio::sync::Semaphore::new(max_parallelism));
+                 let mut join_set = JoinSet::new();
+                 while let Some(req) = frames_inbox.recv().await {
++                    // A JoinSet keeps every finished task until it is joined, so without this the
++                    // set grows by one task allocation per uploaded batch for the replicator's lifetime.
++                    while join_set.try_join_next().is_some() {}
+                     tracing::trace!("Received S3 upload request: {}", req.path);
+                     let start = Instant::now();
+                     let sem = sem.clone();
