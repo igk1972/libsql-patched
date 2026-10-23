@@ -1,21 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: libsql-patched <libsql-patched@localhost>
 Date: Sat, 17 Oct 2026 14:29:37 +0500
-Subject: [PATCH] libsql-server: use jemalloc with heap profiling as the global
- allocator
+Subject: [PATCH] libsql-server: use jemalloc as the global allocator
 
 ---
- Cargo.lock                          | 114 +++++++---------------
- Cargo.toml                          |   2 +
- libsql-server/Cargo.toml            |   4 +-
- libsql-server/src/heap_profile.rs   | 143 ++++++++++++++++++++++++++++
- libsql-server/src/http/admin/mod.rs |  72 ++------------
- libsql-server/src/lib.rs            |  17 +++-
- 6 files changed, 200 insertions(+), 152 deletions(-)
- create mode 100644 libsql-server/src/heap_profile.rs
+ Cargo.lock                          | 102 ++++++----------------------
+ libsql-server/Cargo.toml            |   3 +-
+ libsql-server/src/http/admin/mod.rs |  70 +------------------
+ libsql-server/src/lib.rs            |  14 +++-
+ 4 files changed, 35 insertions(+), 154 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..b8c3e08cccebbe4e24d029705ad1978aecbbde83 100644
+index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..578dfa0050cfdd561fa8bfd7ddaca82b98ff0b8c 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -2002,18 +2002,6 @@ dependencies = [
@@ -61,19 +57,18 @@ index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..b8c3e08cccebbe4e24d029705ad1978a
   "ring",
   "rustls 0.21.12",
   "rustls-pemfile 1.0.4",
-@@ -3084,9 +3062,10 @@ dependencies = [
+@@ -3084,9 +3062,9 @@ dependencies = [
   "serde_json",
   "sha2",
   "sha256",
 - "tar",
   "tempfile",
   "thiserror",
-+ "tikv-jemalloc-ctl",
 + "tikv-jemallocator",
   "tokio",
   "tokio-stream",
   "tokio-tungstenite",
-@@ -3674,7 +3653,7 @@ checksum = "1e401f977ab385c9e4e3ab30627d6f26d00e2c73eef317493c4ec6d468726cf8"
+@@ -3674,7 +3652,7 @@ checksum = "1e401f977ab385c9e4e3ab30627d6f26d00e2c73eef317493c4ec6d468726cf8"
  dependencies = [
   "cfg-if",
   "libc",
@@ -82,7 +77,7 @@ index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..b8c3e08cccebbe4e24d029705ad1978a
   "smallvec",
   "windows-targets 0.52.6",
  ]
-@@ -4175,15 +4154,6 @@ dependencies = [
+@@ -4175,15 +4153,6 @@ dependencies = [
   "crossbeam-utils",
  ]
  
@@ -98,7 +93,7 @@ index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..b8c3e08cccebbe4e24d029705ad1978a
  [[package]]
  name = "redox_syscall"
  version = "0.5.2"
-@@ -4328,23 +4298,6 @@ dependencies = [
+@@ -4328,23 +4297,6 @@ dependencies = [
   "bytemuck",
  ]
  
@@ -122,7 +117,7 @@ index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..b8c3e08cccebbe4e24d029705ad1978a
  [[package]]
  name = "ring"
  version = "0.17.8"
-@@ -5085,17 +5038,6 @@ version = "0.2.0"
+@@ -5085,17 +5037,6 @@ version = "0.2.0"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
  
@@ -140,7 +135,7 @@ index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..b8c3e08cccebbe4e24d029705ad1978a
  [[package]]
  name = "target-lexicon"
  version = "0.12.15"
-@@ -5150,23 +5092,44 @@ dependencies = [
+@@ -5150,23 +5091,33 @@ dependencies = [
  ]
  
  [[package]]
@@ -156,45 +151,34 @@ index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..b8c3e08cccebbe4e24d029705ad1978a
 +]
 +
 +[[package]]
-+name = "tikv-jemalloc-ctl"
-+version = "0.6.1"
++name = "tikv-jemalloc-sys"
++version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
  source = "registry+https://github.com/rust-lang/crates.io-index"
 -checksum = "f0ec81c46e9eb50deaa257be2f148adf052d1fb7701cfd55ccfab2525280b70b"
-+checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
++checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
  dependencies = [
++ "cc",
   "libc",
 - "winapi",
-+ "paste",
-+ "tikv-jemalloc-sys",
  ]
  
  [[package]]
 -name = "thread_local"
 -version = "1.1.8"
-+name = "tikv-jemalloc-sys"
-+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
++name = "tikv-jemallocator"
++version = "0.6.1"
  source = "registry+https://github.com/rust-lang/crates.io-index"
 -checksum = "8b9ef9bad013ada3808854ceac7b46812a6465ba368859a37e2100283d2d719c"
-+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
++checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
  dependencies = [
 - "cfg-if",
 - "once_cell",
-+ "cc",
-+ "libc",
-+]
-+
-+[[package]]
-+name = "tikv-jemallocator"
-+version = "0.6.1"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
-+dependencies = [
 + "libc",
 + "tikv-jemalloc-sys",
  ]
  
  [[package]]
-@@ -6627,17 +6590,6 @@ dependencies = [
+@@ -6627,17 +6578,6 @@ dependencies = [
   "web-sys",
  ]
  
@@ -212,185 +196,22 @@ index 0054abc875d5825f1f37a84eb423dd2679a7f2bd..b8c3e08cccebbe4e24d029705ad1978a
  [[package]]
  name = "xmlparser"
  version = "0.13.6"
-diff --git a/Cargo.toml b/Cargo.toml
-index 53c93e2ba208c6b3a8f5605078434d21143daa28..9dd359c3b0c6bf2173c312aec9b51b4fecf97fcd 100644
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -52,6 +52,8 @@ zerocopy = { version = "0.7.32", features = ["derive", "alloc"] }
- [profile.release]
- codegen-units = 1
- panic = "unwind"
-+# Lets jeprof (addr2line -i) resolve inlined frames in heap profiles.
-+debug = "line-tables-only"
- 
- # The profile that 'cargo dist' will build with
- [profile.dist]
 diff --git a/libsql-server/Cargo.toml b/libsql-server/Cargo.toml
-index 06107d0557cef2657402fcc8840dad591ab8631a..4e773ff3e8f378ea874a3cb3471ce6135199fcfa 100644
+index 06107d0557cef2657402fcc8840dad591ab8631a..4c7cd0135b52512e957b9401cefe66a6278fd9e9 100644
 --- a/libsql-server/Cargo.toml
 +++ b/libsql-server/Cargo.toml
-@@ -88,8 +88,8 @@ hdrhistogram = "7.5.4"
+@@ -88,8 +88,7 @@ hdrhistogram = "7.5.4"
  crossbeam = "0.8.4"
  async-recursion = "1"
  mimalloc = "0.1.42"
 -rheaper = { git = "https://github.com/MarinPostma/rheaper.git", tag = "v0.2.0", default-features = false, features = ["allocator"] }
 -tar = "0.4.41"
-+tikv-jemalloc-ctl = { version = "0.6.1", features = ["stats", "use_std"] }
-+tikv-jemallocator = { version = "0.6.1", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
++tikv-jemallocator = { version = "0.6.1", features = ["unprefixed_malloc_on_supported_platforms"] }
  aws-config = { version = "1", features = ["behavior-version-latest"] }
  aws-sdk-s3 = "1"
  aws-smithy-runtime = "1.6.2"
-diff --git a/libsql-server/src/heap_profile.rs b/libsql-server/src/heap_profile.rs
-new file mode 100644
-index 0000000000000000000000000000000000000000..ffc3af4fb7785303596b2bcfa10b01fe9b160a2a
---- /dev/null
-+++ b/libsql-server/src/heap_profile.rs
-@@ -0,0 +1,143 @@
-+//! jemalloc heap profiles and allocator statistics.
-+//!
-+//! Profiling is compiled in, but jemalloc only samples allocations when the process starts with
-+//! `MALLOC_CONF=prof:true`. Profiles are read with `jeprof`.
-+
-+use std::ffi::{CStr, CString, OsStr};
-+use std::fmt;
-+use std::os::raw::c_char;
-+use std::os::unix::ffi::OsStrExt;
-+use std::path::PathBuf;
-+use std::sync::Once;
-+use std::time::Duration;
-+
-+use anyhow::Context as _;
-+use serde::Serialize;
-+use tikv_jemalloc_ctl::{epoch, raw, stats};
-+
-+const INTERVAL_ENV: &str = "LIBSQL_HEAP_PROFILE_INTERVAL_SECS";
-+
-+/// Process-wide jemalloc counters, in bytes.
-+#[derive(Debug, Serialize)]
-+pub struct HeapStats {
-+    pub allocated: usize,
-+    pub active: usize,
-+    pub resident: usize,
-+    pub mapped: usize,
-+    pub retained: usize,
-+    pub metadata: usize,
-+}
-+
-+impl fmt::Display for HeapStats {
-+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        write!(
-+            f,
-+            "allocated {}, active {}, resident {}, mapped {}, retained {}, metadata {}",
-+            self.allocated, self.active, self.resident, self.mapped, self.retained, self.metadata
-+        )
-+    }
-+}
-+
-+#[derive(Debug, Serialize)]
-+pub struct HeapProfile {
-+    pub path: PathBuf,
-+    pub stats: HeapStats,
-+}
-+
-+pub fn heap_stats() -> anyhow::Result<HeapStats> {
-+    // jemalloc refreshes the stats it reports only when the epoch advances.
-+    epoch::advance()?;
-+    Ok(HeapStats {
-+        allocated: stats::allocated::read()?,
-+        active: stats::active::read()?,
-+        resident: stats::resident::read()?,
-+        mapped: stats::mapped::read()?,
-+        retained: stats::retained::read()?,
-+        metadata: stats::metadata::read()?,
-+    })
-+}
-+
-+fn profiling_enabled() -> bool {
-+    unsafe { raw::read::<bool>(b"opt.prof\0") }.unwrap_or(false)
-+}
-+
-+/// `opt.prof_prefix`, with its directory created: jemalloc does not create it and silently skips
-+/// the dumps it triggers itself (`lg_prof_interval`, `prof_final`) when it is missing.
-+fn prof_prefix() -> anyhow::Result<PathBuf> {
-+    let prefix = unsafe { raw::read::<*const c_char>(b"opt.prof_prefix\0") }?;
-+    let prefix = PathBuf::from(OsStr::from_bytes(
-+        unsafe { CStr::from_ptr(prefix) }.to_bytes(),
-+    ));
-+    if let Some(dir) = prefix.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-+        std::fs::create_dir_all(dir).with_context(|| {
-+            format!("failed to create heap profile directory {}", dir.display())
-+        })?;
-+    }
-+    Ok(prefix)
-+}
-+
-+/// Writes a heap profile to `<opt.prof_prefix>.<UTC time>.heap`.
-+pub fn dump_heap_profile() -> anyhow::Result<HeapProfile> {
-+    if !profiling_enabled() {
-+        anyhow::bail!("heap profiling is off: start sqld with MALLOC_CONF=prof:true");
-+    }
-+    let mut path = prof_prefix()?.into_os_string();
-+    path.push(format!(
-+        ".{}.heap",
-+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
-+    ));
-+    let path = PathBuf::from(path);
-+    let c_path = CString::new(path.as_os_str().as_bytes())?;
-+    unsafe { raw::write(b"prof.dump\0", c_path.as_ptr()) }
-+        .with_context(|| format!("failed to write heap profile {}", path.display()))?;
-+    Ok(HeapProfile {
-+        path,
-+        stats: heap_stats()?,
-+    })
-+}
-+
-+/// With `LIBSQL_HEAP_PROFILE_INTERVAL_SECS` set, logs the allocator stats at that interval and,
-+/// when profiling is on, writes a heap profile each time.
-+pub fn start() -> anyhow::Result<()> {
-+    let interval = match std::env::var(INTERVAL_ENV) {
-+        Ok(value) => match value.parse::<u64>() {
-+            Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
-+            _ => anyhow::bail!("{INTERVAL_ENV} must be a positive integer, got `{value}`"),
-+        },
-+        Err(_) => None,
-+    };
-+
-+    static STARTED: Once = Once::new();
-+    STARTED.call_once(|| {
-+        if profiling_enabled() {
-+            match prof_prefix() {
-+                Ok(prefix) => tracing::info!(
-+                    "heap profiling is on, profiles go to {}.*.heap",
-+                    prefix.display()
-+                ),
-+                Err(e) => tracing::error!("heap profiling is on, but {e:#}"),
-+            }
-+        }
-+        let Some(interval) = interval else { return };
-+        let spawned = std::thread::Builder::new()
-+            .name("heap-profile".into())
-+            .spawn(move || loop {
-+                std::thread::sleep(interval);
-+                if profiling_enabled() {
-+                    match dump_heap_profile() {
-+                        Ok(p) => tracing::info!("heap profile {}: {}", p.path.display(), p.stats),
-+                        Err(e) => tracing::error!("{e:#}"),
-+                    }
-+                } else {
-+                    match heap_stats() {
-+                        Ok(stats) => tracing::info!("heap: {stats}"),
-+                        Err(e) => tracing::error!("failed to read jemalloc stats: {e:#}"),
-+                    }
-+                }
-+            });
-+        if let Err(e) = spawned {
-+            tracing::error!("failed to start the heap profile thread: {e}");
-+        }
-+    });
-+    Ok(())
-+}
 diff --git a/libsql-server/src/http/admin/mod.rs b/libsql-server/src/http/admin/mod.rs
-index 2a3a4faaae5cd009bce188bb07d14e372dd35e81..d6f7216a993625693b5a6c48f88e1ece223d8bde 100644
+index 2a3a4faaae5cd009bce188bb07d14e372dd35e81..e9e9fd28cb12401450dfbb404f567cde9132bf07 100644
 --- a/libsql-server/src/http/admin/mod.rs
 +++ b/libsql-server/src/http/admin/mod.rs
 @@ -1,24 +1,21 @@
@@ -420,21 +241,21 @@ index 2a3a4faaae5cd009bce188bb07d14e372dd35e81..d6f7216a993625693b5a6c48f88e1ece
  use tower_http::trace::DefaultOnResponse;
  use url::Url;
  
-@@ -177,9 +174,7 @@ where
+@@ -177,9 +174,6 @@ where
          )
          .route("/v1/diagnostics", get(handle_diagnostics))
          .route("/metrics", get(handle_metrics))
 -        .route("/profile/heap/enable", post(enable_profile_heap))
 -        .route("/profile/heap/disable/:id", post(disable_profile_heap))
 -        .route("/profile/heap/:id", delete(delete_profile_heap))
-+        .route("/profile/heap/dump", post(handle_dump_heap_profile))
          .route("/log-filter", post(handle_set_log_filter))
          .with_state(Arc::new(AppState {
              namespaces: namespaces.clone(),
-@@ -561,62 +556,7 @@ async fn handle_checkpoint<C>(
+@@ -560,63 +554,3 @@ async fn handle_checkpoint<C>(
+     app_state.namespaces.checkpoint(namespace).await?;
      Ok(())
  }
- 
+-
 -#[derive(serde::Deserialize)]
 -struct EnableHeapProfileRequest {
 -    #[serde(default)]
@@ -493,23 +314,12 @@ index 2a3a4faaae5cd009bce188bb07d14e372dd35e81..d6f7216a993625693b5a6c48f88e1ece
 -    let profile_dir = PathBuf::from("heap_profile").join(&profile);
 -    tokio::fs::remove_dir_all(&profile_dir).await?;
 -    Ok(())
-+async fn handle_dump_heap_profile() -> crate::Result<Json<crate::heap_profile::HeapProfile>> {
-+    let profile = tokio::task::spawn_blocking(crate::heap_profile::dump_heap_profile).await??;
-+    Ok(Json(profile))
- }
+-}
 diff --git a/libsql-server/src/lib.rs b/libsql-server/src/lib.rs
-index 1642ad951a064efebb9c2c2370946743d201782e..038f30d98a451925563267984577c8207f1e2faa 100644
+index 1642ad951a064efebb9c2c2370946743d201782e..81aecab48759dacf84c5f50dddc1e97ea8e72e85 100644
 --- a/libsql-server/src/lib.rs
 +++ b/libsql-server/src/lib.rs
-@@ -76,6 +76,7 @@ pub use hrana::proto as hrana_proto;
- mod database;
- mod error;
- mod h2c;
-+mod heap_profile;
- mod heartbeat;
- mod hrana;
- mod http;
-@@ -123,8 +124,14 @@ type MakeReplicationSvc = Box<
+@@ -123,8 +123,14 @@ type MakeReplicationSvc = Box<
  // static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
  
  #[global_allocator]
@@ -526,16 +336,7 @@ index 1642ad951a064efebb9c2c2370946743d201782e..038f30d98a451925563267984577c820
  
  pub struct Server<C = HttpConnector, A = AddrIncoming, D = HttpsConnector<HttpConnector>> {
      pub path: Arc<Path>,
-@@ -545,6 +552,8 @@ where
-             setup_sqlite_alloc();
-         }
- 
-+        heap_profile::start()?;
-+
-         INIT.call_once(|| {
-             if let Ok(size) = std::env::var("LIBSQL_EXPERIMENTAL_PAGER") {
-                 let size = size.parse().unwrap();
-@@ -950,7 +959,9 @@ fn setup_sqlite_alloc() {
+@@ -950,7 +956,9 @@ fn setup_sqlite_alloc() {
      unsafe extern "C" fn free(ptr: *mut c_void) {
          let orig_ptr = ptr.offset(-(size_of::<usize>() as isize));
          let size = *(orig_ptr as *mut usize);
