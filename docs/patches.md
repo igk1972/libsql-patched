@@ -231,7 +231,7 @@ grows by about 130 bytes per statement for as long as it runs — some 7 MB/h at
 Without the patch, `LIBSQL_DISABLE_METRICS=true` (`--disable-metrics`) stops the growth too, at
 the price of an empty `/metrics`.
 
-### 0012 — libsql-server: use jemalloc with heap profiling as the global allocator
+### 0012 — libsql-server: use jemalloc as the global allocator
 
 At `LIBSQL_REF` sqld's global allocator is `rheaper::Allocator<System>`: glibc malloc behind an
 allocation tracker that the admin API could switch on. It saw only Rust allocations: SQLite and
@@ -239,27 +239,14 @@ the rest of the C code call glibc `malloc` directly. This patch replaces it with
 (`tikv-jemallocator` 0.6.1, jemalloc 5.3.0):
 
 - `unprefixed_malloc_on_supported_platforms`: on Linux jemalloc also provides `malloc`, `free`
-  and the rest for the C code, so the whole process runs on one allocator, and heap profiles
-  cover SQLite too. Apple targets do not support it: on macOS only Rust allocations go to
-  jemalloc, and its options are read from `_RJEM_MALLOC_CONF`.
-- `profiling`: the profiler is built in and does nothing until sqld starts with `prof:true` in
-  `MALLOC_CONF`.
+  and the rest for the C code, so the whole process runs on one allocator. Apple targets do not
+  support it: on macOS only Rust allocations go to jemalloc, and its options are read from
+  `_RJEM_MALLOC_CONF`.
 - `libsql-server/src/lib.rs` — on Linux sqld defines jemalloc's `malloc_conf` as
   `background_thread:true`; `MALLOC_CONF` from the environment is applied on top of it. Without
   background threads an arena returns freed pages to the system only when it allocates again,
   so the arenas of idle or exited threads — sqld runs SQLite on a blocking pool whose threads come
   and go — would keep theirs indefinitely.
-- `libsql-server/src/heap_profile.rs`:
-  - `POST /profile/heap/dump` on the admin API writes a profile to
-    `<prof_prefix>.<UTC time>.heap` (e.g. `/var/lib/sqld/prof/jeprof.20261017T120000.123Z.heap`)
-    and returns `{"path": …, "stats": {…}}`; with profiling off it fails with 500 and says so;
-  - `LIBSQL_HEAP_PROFILE_INTERVAL_SECS`: every that many seconds a profile is written and logged
-    as `heap profile <path>: allocated …, active …, resident …, mapped …, retained …,
-    metadata …`; with profiling off, only the counters are logged (`heap: allocated …`). A value
-    that is not a positive integer makes sqld fail at startup;
-  - the directory of `prof_prefix` is created at startup and before every dump: jemalloc does
-    not create it, and without it the dumps jemalloc triggers itself (`lg_prof_interval`,
-    `prof_final`) are silently lost.
 - `libsql-server/src/http/admin/mod.rs` — rheaper's `/profile/heap/enable`,
   `/profile/heap/disable/:id` and `/profile/heap/:id` are removed, and with them the `rheaper`
   and `tar` dependencies.
@@ -268,30 +255,13 @@ the rest of the C code call glibc `malloc` directly. This patch replaces it with
   header in front of it. glibc ignores the size; jemalloc's sized deallocation picks the size
   class from it, so a block that the header pushed into the next size class would be freed into
   the smaller one, corrupting the heap.
-- `Cargo.toml` — `[profile.release] debug = "line-tables-only"`: jeprof runs `addr2line -i` and
-  shows inlined frames with file and line. The sections are not loaded at run time; the binary
-  file grows.
 
-The counters: `allocated` is what the program holds; `active` the pages those allocations
-occupy; `resident` what jemalloc keeps in RAM, its own metadata and freed pages not yet returned
-to the system included; `retained` address space jemalloc keeps mapped without memory behind it.
-`allocated` growing means a leak; `resident` growing while `allocated` stays flat means
-fragmentation or caching inside the allocator.
-
-`MALLOC_CONF` options worth knowing:
-
-- `lg_prof_sample:N` — one sampled allocation per 2^N bytes allocated (default 19, 512 KiB); 17
-  is enough to see a few MB a day;
-- `lg_prof_interval:N` dumps after every 2^N bytes allocated in total, so the number of files
-  depends on load; `LIBSQL_HEAP_PROFILE_INTERVAL_SECS` dumps by time;
-- `prof_final:true` names its dump `<prefix>.<pid>.<seq>.f.heap`; in a container sqld usually
-  runs as pid 1, so every restart overwrites the previous one;
-- `stats_print:true` prints all of jemalloc's options and statistics to stderr at exit.
-
-Reading a profile needs the binary that wrote it, `jeprof` (built with jemalloc, in
-`target/release/build/tikv-jemalloc-sys-*/out/build/bin/`) and binutils:
-`jeprof --text /bin/sqld <profile>`, and for growth between two profiles
-`jeprof --text --base=<earlier> /bin/sqld <later>`.
+jemalloc's heap profiler is not built in. To find a leak, build with `tikv-jemallocator`'s
+`profiling` feature and start sqld with
+`MALLOC_CONF=prof:true,lg_prof_sample:17,lg_prof_interval:30,prof_prefix:<dir>/jeprof`: it dumps a
+profile after every GiB allocated, into a directory that must already exist. Growth between two
+dumps a day apart, by call stack: `jeprof --text --base=<earlier> sqld <later>`, with jeprof and
+binutils of the same jemalloc version (Debian's `libjemalloc-dev` ships jeprof 5.3.0).
 
 ### 0013 — bottomless: join finished S3 upload tasks instead of keeping them until shutdown
 
